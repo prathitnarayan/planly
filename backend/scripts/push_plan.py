@@ -40,6 +40,7 @@ def main() -> None:
     try:
         rec = repo.create(user_id, interview)
         rec.blueprint, rec.capacity = plan.blueprint, plan.capacity
+        rec.plan_start, rec.checked_through = plan.start, plan.checked_through
         repo.save(user_id, rec)
         if plan.checkins:
             repo.add_checkins(user_id, rec.id, plan.checkins)

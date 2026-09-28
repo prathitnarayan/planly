@@ -35,13 +35,18 @@ backend/app/
   ai/prompts.py          all prompts
   ai/goal_intake.py      interview turns + blueprint generation
   core/config.py         .env settings
-  core/store.py          TEMP in-memory store (→ Supabase next)
+  core/auth.py           verifies Supabase JWTs (ES256/RS256 via public JWKS, legacy HS256); dev mode = fixed user
+  core/repo.py           GoalRepo: InMemoryRepo (dev/tests) + PostgresRepo (Supabase). EVERY query filters by user_id
   core/estimate_log.py   AI estimate vs user correction → data/estimate_corrections.jsonl (future ML data)
   main.py                FastAPI app
 backend/scripts/try_goal.py  interview → blueprint → estimates → feasibility → schedule → save
-backend/scripts/checkin.py   daily check-in on the saved plan → replan from tomorrow
+backend/scripts/checkin.py   daily check-in → replan. Supabase by default (scripts/session.py remembers
+                             sign-in via refresh token in data/session.json); --local = data/plan.json
 backend/tests/           pytest; every planner function gets tests
-database/migrations/     001_init.sql — Supabase schema + RLS
+database/migrations/     001_planly.sql (+ 002_tracking.sql: plan_start, checked_through). Run in order.
+                         001_planly.sql — goals (JSONB docs) + append-only checkins / estimate_corrections, RLS
+docs/SUPABASE_SETUP.md   step-by-step connection guide
+docs/normalized_schema_future.sql  NOT applied — future row-per-milestone design
 ```
 
 ## Conventions
@@ -86,14 +91,22 @@ database/migrations/     001_init.sql — Supabase schema + RLS
   ML dataset — don't skip logging.
 - LLM output is validated by Pydantic. On failure, send the error back to the LLM
   and retry once.
-- If FastAPI uses the Supabase service-role key, RLS is bypassed: filter every
-  query by `user_id` in code.
+- The backend connects with the DB password, which bypasses RLS: repo.py filters EVERY
+  query by user_id (tested: another user gets 404 on read/write/check-in/delete).
+  RLS stays on as the second lock. Never put the service_role key in the backend.
+- Repos return copies; changes persist only via save()/add_checkins() — so in-memory
+  behaves like the DB. Check-ins are append-only and only change via add_checkins().
+- No SUPABASE_URL = dev mode (in-memory, one dev user). DATABASE_URL without SUPABASE_URL
+  is refused at startup (a real DB with no login).
+- Tests: conftest forces in-memory + dev auth even if .env has real values. Postgres tests
+  run only with PLANLY_TEST_PG set (they create/drop their own database).
 
 ## Run
 ```
 cd backend
 pip install -r requirements.txt
 pytest                         # tests (AI tests use a FakeLLM, no key needed)
+python -m scripts.login        # Supabase sign-in → token for /docs Authorize
 python -m scripts.try_goal     # chat with the real API in the terminal
 python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localhost:8000/docs
 ```
@@ -104,15 +117,23 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
 - [x] Capacity + feasibility engine, `/feasibility` endpoint (stateless)
 - [x] AI interview → blueprint generation (OpenAI JSON mode, validated, code-enforced question limit)
 - [x] Goal check at the start + 'Look right?' confirm/correct step (script + API)
-- [ ] Supabase auth (verify JWT in FastAPI) + persist goals/slots (replace core/store.py)
+- [x] Supabase: JWT auth in FastAPI, Postgres repo, RLS migration, login + push_plan scripts
 - [ ] Resources typed in by user → structured units → milestone mapping
 - [x] Per-milestone due dates / start windows, required vs optional, EDF feasibility
 - [x] Benchmarks (with parts), code-level estimate check, per-deliverable overrides, correction log
 - [x] Hard vs soft deadlines, days late per item
 - [x] Sprint scheduler: timed sessions in slots, learn-before-practice, weekly sprints + definition of done, /schedule endpoint
 - [x] Check-ins (done / partial / missed + finished?) → progress → multiplier → replan; API + checkin script
-- [ ] Frontend
+- [x] Frontend (frontend/): Next.js 16 + Tailwind, monochrome. Login (Supabase JS), goals, goal check,
+      interview, confirm/correct, hours + estimate warnings, free time, plan, check-in. See frontend/README.md.
+      Backend: CORS (FRONTEND_ORIGINS), /due, GET /blueprint, GET /capacity, replan starts at the right day.
 - Later: web research, PDF parsing, ML duration model, what-if simulation
+
+## Frontend rules
+- Monochrome only: ink / paper / muted / line / soft tokens (app/globals.css). State via weight, rules and
+  symbols (✓ ! ○), never colour. Dark mode = same tokens inverted.
+- Pages only call the API (lib/api.ts adds the Supabase token). No planning logic in the frontend.
+- tests/fake_ai_server.py runs the real API with a scripted AI, for UI work without an AI key.
 
 ## Out of scope for v0
 Web research agent, PDF/course parsing, calendar sync, ML models, non-learning goal types.

@@ -23,7 +23,8 @@ from __future__ import annotations
 from datetime import date, timedelta
 from functools import lru_cache
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.ai.goal_intake import (
@@ -39,12 +40,45 @@ from app.core.repo import (
 from app.planners.capacity import CapacityProfile
 from app.planners.estimate_check import EstimateWarning, check_estimates
 from app.planners.feasibility import FeasibilityResult, check_feasibility, resolve_items
-from app.planners.progress import CheckIn, ReplanResult, replan
+from app.planners.progress import CheckIn, DueSession, ReplanResult, due_sessions, replan
 from app.planners.scheduler import Schedule, build_schedule
 from app.schemas.blueprint import GoalBlueprint
 from app.schemas.interview import GoalCheck, GoalProfile
 
-app = FastAPI(title="Planly API", version="0.3.0")
+app = FastAPI(title="Planly API", version="0.4.0")
+
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+
+# The browser frontend runs on another port; allow it (and only it) to call the API.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.FRONTEND_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+
+try:  # only when Postgres support is installed
+    from psycopg import errors as pg_errors
+
+    @app.exception_handler(pg_errors.UndefinedTable)
+    async def tables_missing(_: Request, exc: Exception) -> JSONResponse:
+        """Real first run (28 Sep): a bare 500 when the migration hadn't been run yet."""
+        return JSONResponse(status_code=503, content={
+            "detail": "Database tables are missing. In Supabase: SQL Editor -> New query -> paste "
+                      "database/migrations/001_planly.sql -> Run.",
+            "error": str(exc).splitlines()[0],
+        })
+
+    @app.exception_handler(pg_errors.UndefinedColumn)
+    async def columns_missing(_: Request, exc: Exception) -> JSONResponse:
+        return JSONResponse(status_code=503, content={
+            "detail": "The database needs a newer migration. In Supabase: SQL Editor -> run every "
+                      "file in database/migrations/ you haven't run yet (e.g. 002_tracking.sql).",
+            "error": str(exc).splitlines()[0],
+        })
+except ImportError:  # pragma: no cover
+    pass
 
 
 # ---------- dependencies ----------
@@ -114,6 +148,8 @@ class GoalView(BaseModel):
     summary: list[str]          # plain-language "what I understood", for the confirm screen
     has_blueprint: bool
     has_capacity: bool
+    plan_start: date | None
+    checked_through: date | None
 
 
 def to_view(rec: GoalRecord) -> GoalView:
@@ -128,6 +164,8 @@ def to_view(rec: GoalRecord) -> GoalView:
         summary=iv.profile.describe(),
         has_blueprint=rec.blueprint is not None,
         has_capacity=rec.capacity is not None,
+        plan_start=rec.plan_start,
+        checked_through=rec.checked_through,
     )
 
 
@@ -242,6 +280,14 @@ def make_blueprint(goal_id: str, ctx: Ctx = Depends(), llm: LLMClient = Depends(
     return rec.blueprint
 
 
+@app.get("/goals/{goal_id}/blueprint", response_model=GoalBlueprint)
+def read_blueprint(goal_id: str, ctx: Ctx = Depends()) -> GoalBlueprint:
+    rec = ctx.load(goal_id)
+    if not rec.blueprint:
+        raise HTTPException(status_code=404, detail="no blueprint yet")
+    return rec.blueprint
+
+
 class HoursEdit(BaseModel):
     hours: float
 
@@ -336,11 +382,23 @@ def goal_schedule(goal_id: str, body: GoalFeasibilityRequest, ctx: Ctx = Depends
 # ---------- the loop: capacity -> check-ins -> replan ----------
 
 @app.put("/goals/{goal_id}/capacity", response_model=CapacityProfile)
-def set_capacity(goal_id: str, body: CapacityProfile, ctx: Ctx = Depends()) -> CapacityProfile:
+def set_capacity(goal_id: str, body: CapacityProfile, start: date | None = None,
+                 ctx: Ctx = Depends()) -> CapacityProfile:
+    """Save weekly free time. The first time, this also fixes the plan's start (default tomorrow)."""
     rec = ctx.load(goal_id)
     rec.capacity = body
+    if rec.plan_start is None or start is not None:
+        rec.plan_start = start or tomorrow()
     ctx.save(rec)
     return body
+
+
+@app.get("/goals/{goal_id}/capacity", response_model=CapacityProfile)
+def read_capacity(goal_id: str, ctx: Ctx = Depends()) -> CapacityProfile:
+    rec = ctx.load(goal_id)
+    if not rec.capacity:
+        raise HTTPException(status_code=404, detail="no capacity yet")
+    return rec.capacity
 
 
 def _replan(rec: GoalRecord, checkins: list[CheckIn], today: date) -> ReplanResult:
@@ -355,6 +413,39 @@ def _replan(rec: GoalRecord, checkins: list[CheckIn], today: date) -> ReplanResu
         raise HTTPException(status_code=422, detail=str(e))
 
 
+def _items(rec: GoalRecord):
+    p = rec.interview.profile
+    return resolve_items(require_blueprint(rec), p.key_date_map(), p.deadline, 1.0,
+                         p.soft_key_dates(), p.deadline_hard)
+
+
+class DueView(BaseModel):
+    since: date
+    until: date
+    sessions: list[DueSession]
+    message: str | None = None   # e.g. "your plan starts Tue 29 Sep"
+
+
+@app.get("/goals/{goal_id}/due", response_model=DueView)
+def get_due(goal_id: str, today: date | None = None, ctx: Ctx = Depends()) -> DueView:
+    """The planned sessions since the last check-in, up to today — what the check-in screen asks about."""
+    rec = ctx.load(goal_id)
+    if not rec.capacity or not rec.plan_start:
+        raise HTTPException(status_code=409, detail="set capacity first: PUT /goals/{id}/capacity")
+    today = today or date.today()
+    since = (rec.checked_through + timedelta(days=1)) if rec.checked_through else rec.plan_start
+    if since > today:
+        msg = (f"Your plan starts {rec.plan_start:%a %d %b}." if rec.checked_through is None
+               else f"Already checked in up to {rec.checked_through:%a %d %b}.")
+        return DueView(since=since, until=today, sessions=[], message=msg)
+    try:
+        sessions = due_sessions(require_blueprint(rec), _items(rec), rec.checkins, rec.capacity, since, today)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return DueView(since=since, until=today, sessions=sessions,
+                   message=None if sessions else "Nothing was planned in that stretch.")
+
+
 class CheckInBatch(BaseModel):
     checkins: list[CheckIn]
     today: date | None = None   # default: today. The replan starts the day after.
@@ -364,16 +455,28 @@ class CheckInBatch(BaseModel):
 def add_checkins(goal_id: str, body: CheckInBatch, ctx: Ctx = Depends()) -> ReplanResult:
     """Log what actually happened; get back progress, alerts and the updated plan from tomorrow."""
     rec = ctx.load(goal_id)
+    today = body.today or date.today()
     # Replan FIRST with the new check-ins; only store them if that works (bad batch = nothing saved).
-    result = _replan(rec, rec.checkins + body.checkins, (body.today or date.today()) + timedelta(days=1))
-    ctx.repo.add_checkins(ctx.user_id, rec.id, body.checkins)
+    result = _replan(rec, rec.checkins + body.checkins, today + timedelta(days=1))
+    if body.checkins:
+        ctx.repo.add_checkins(ctx.user_id, rec.id, body.checkins)
+    if rec.checked_through is None or today > rec.checked_through:
+        rec.checked_through = today
+        ctx.save(rec)
     return result
 
 
 @app.get("/goals/{goal_id}/replan", response_model=ReplanResult)
 def get_replan(goal_id: str, today: date | None = None, ctx: Ctx = Depends()) -> ReplanResult:
+    """The plan from the first day that still needs doing: not before the plan starts,
+    and not a day you've already checked in for (that work is already counted)."""
     rec = ctx.load(goal_id)
-    return _replan(rec, rec.checkins, today or date.today())
+    start = today or date.today()
+    if rec.plan_start and rec.plan_start > start:
+        start = rec.plan_start
+    if rec.checked_through and rec.checked_through >= start:
+        start = rec.checked_through + timedelta(days=1)
+    return _replan(rec, rec.checkins, start)
 
 
 # ---------- stateless, no login: experiment with a hand-written blueprint ----------

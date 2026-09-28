@@ -181,3 +181,40 @@ def replan(
                       f"remaining work is adjusted (×{multiplier}).")
     return ReplanResult(today=today, progress=progress, multiplier=multiplier,
                         feasibility=verdict, schedule=schedule, alerts=alerts)
+
+
+class DueSession(BaseModel):
+    day: date
+    milestone_key: str
+    milestone_name: str
+    planned_minutes: int
+
+
+def due_sessions(
+    blueprint: GoalBlueprint,
+    items: list[PlanItem],
+    checkins: list[CheckIn],
+    capacity: CapacityProfile,
+    since: date,
+    until: date,
+) -> list[DueSession]:
+    """
+    What the plan asked for between `since` and `until` (inclusive), as it stood at `since`
+    — i.e. after the previous check-in. One row per (day, milestone). This is the list the
+    user answers done / partial / missed for.
+    """
+    if since > until:
+        return []
+    names = {it.key: it.name for it in items}
+    before = replan(blueprint, items, checkins, capacity, today=since)
+    totals: dict[tuple[date, str], int] = {}
+    for sprint in before.schedule.sprints:
+        for day in sprint.days:
+            if day.day > until:
+                continue
+            for s in day.sessions:
+                totals[(day.day, s.milestone_key)] = totals.get((day.day, s.milestone_key), 0) + s.minutes
+    return [
+        DueSession(day=d, milestone_key=k, milestone_name=names[k], planned_minutes=m)
+        for (d, k), m in sorted(totals.items())
+    ]

@@ -16,7 +16,7 @@ object would silently fail on the real database.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Protocol
 
 from pydantic import BaseModel, Field
@@ -33,6 +33,8 @@ class GoalRecord(BaseModel):
     blueprint: GoalBlueprint | None = None
     capacity: CapacityProfile | None = None
     checkins: list[CheckIn] = Field(default_factory=list)
+    plan_start: date | None = None        # first planned day (set when capacity is first saved)
+    checked_through: date | None = None   # last day the user has checked in for
 
     @property
     def title(self) -> str:
@@ -176,7 +178,8 @@ class PostgresRepo:
             return None
         with self.pool.connection() as conn:
             row = conn.execute(
-                "select interview, blueprint, capacity from public.goals where id = %s and user_id = %s",
+                """select interview, blueprint, capacity, plan_start, checked_through
+                   from public.goals where id = %s and user_id = %s""",
                 (goal_id, user_id),
             ).fetchone()
             if row is None:
@@ -193,6 +196,8 @@ class PostgresRepo:
             interview=InterviewState.model_validate(row[0]),
             blueprint=GoalBlueprint.model_validate(row[1]) if row[1] else None,
             capacity=CapacityProfile.model_validate(row[2]) if row[2] else None,
+            plan_start=row[3],
+            checked_through=row[4],
             checkins=[
                 CheckIn(day=c[0], milestone_key=c[1], outcome=c[2], planned_minutes=c[3],
                         actual_minutes=c[4], milestone_complete=c[5], remaining_minutes=c[6], note=c[7])
@@ -219,10 +224,11 @@ class PostgresRepo:
     def save(self, user_id, rec):
         with self.pool.connection() as conn:
             cur = conn.execute(
-                """update public.goals set title = %s, interview = %s, blueprint = %s, capacity = %s
+                """update public.goals set title = %s, interview = %s, blueprint = %s, capacity = %s,
+                          plan_start = %s, checked_through = %s
                    where id = %s and user_id = %s""",
                 (rec.title, self._json(rec.interview), self._json(rec.blueprint),
-                 self._json(rec.capacity), rec.id, user_id),
+                 self._json(rec.capacity), rec.plan_start, rec.checked_through, rec.id, user_id),
             )
             if cur.rowcount != 1:
                 raise KeyError(rec.id)

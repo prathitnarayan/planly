@@ -11,9 +11,13 @@ cd backend
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pytest
-uvicorn app.main:app --reload
+python -m uvicorn app.main:app --reload --reload-dir app
 ```
 Open http://localhost:8000/docs and try `POST /feasibility`.
 
+## Frontend
+See `frontend/README.md` (`npm install`, `npm run dev`).
+
 ## Database
-Run `database/migrations/001_init.sql` in the Supabase SQL editor.
+Run every file in `database/migrations/` (001, 002, …) in the Supabase SQL editor, in order.
+Full setup: `docs/SUPABASE_SETUP.md`.

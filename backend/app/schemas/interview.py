@@ -116,7 +116,7 @@ class GoalProfile(BaseModel):
         else:
             lines.append("Deadline:       none")
         for b in self.benchmarks:
-            parts = ", ".join(f"{k} {v:g}h" for k, v in b.parts.items())
+            parts = ", ".join(f"{k.replace('_', ' ')} {v:g}h" for k, v in b.parts.items())
             lines.append(f"Track record:   {b.what} took {b.hours:g}h" + (f" ({parts})" if parts else ""))
         if not self.benchmarks:
             lines.append("Track record:   none given")

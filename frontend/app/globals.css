@@ -1,0 +1,42 @@
+@import "tailwindcss";
+
+/* Monochrome. One ink, one paper, three greys. No accent colour: emphasis comes from
+   weight, size, rules and symbols (✓ ! —), so it reads the same in light and dark. */
+:root {
+  --paper: #ffffff;
+  --ink: #0b0b0b;
+  --muted: #6e6e6e;
+  --line: #e4e4e4;
+  --soft: #f4f4f4;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #0b0b0b;
+    --ink: #f2f2f2;
+    --muted: #9b9b9b;
+    --line: #2a2a2a;
+    --soft: #151515;
+  }
+}
+
+@theme inline {
+  --color-paper: var(--paper);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-soft: var(--soft);
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+html { color-scheme: light dark; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+.num { font-variant-numeric: tabular-nums; }
+::selection { background: var(--ink); color: var(--paper); }
+input, textarea, select { font: inherit; }
+:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }

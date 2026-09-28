@@ -34,3 +34,8 @@ def check_safe_config() -> None:
             "DATABASE_URL is set but SUPABASE_URL is empty: that would run a real database "
             "with no login. Set SUPABASE_URL (or ALLOW_DEV_AUTH_WITH_DB=1 for a throwaway local DB)."
         )
+
+# Browser origins allowed to call the API (the Next.js frontend). Comma-separated.
+FRONTEND_ORIGINS = [
+    o.strip() for o in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(",") if o.strip()
+]

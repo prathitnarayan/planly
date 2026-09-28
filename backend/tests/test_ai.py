@@ -420,7 +420,7 @@ def test_profile_describe_is_readable():
     lines = p.describe()
     assert "A2 due — Thu 15 Oct (flexible)" in lines[2]            # sorted by date
     assert "A3 due — Thu 05 Nov (hard)" in lines[3]
-    assert "Assignment 1 took 25h (notebook 18h, video 4h, peer_review 3h)" in lines[4]
+    assert "Assignment 1 took 25h (notebook 18h, video 4h, peer review 3h)" in lines[4]
 
 
 def test_api_goal_check_and_correction(client_with):
@@ -440,6 +440,60 @@ def test_api_goal_check_and_correction(client_with):
     assert any("reviews mandatory" in line for line in g["summary"])
     assert g["has_blueprint"] is False                        # stale blueprint dropped
     assert c.post(f"/goals/{g['id']}/correct", json={"text": "  "}).status_code == 422
+
+
+def test_api_due_sessions_and_checked_through(client_with):
+    """The check-in screen's loop: what's due -> answer -> nothing due until tomorrow."""
+    c = client_with([turn(done=True, deadline="2026-12-01"), BLUEPRINT])
+    g = c.post("/goals", json={"goal": "Learn SQL"}).json()
+    c.post(f"/goals/{g['id']}/blueprint")
+    slots = [{"weekday": d, "start": "19:00", "end": "20:00"} for d in range(5)]
+    c.put(f"/goals/{g['id']}/capacity", params={"start": "2026-09-28"},
+          json={"slots": slots, "sustainable_ratio": 1.0})
+
+    early = c.get(f"/goals/{g['id']}/due", params={"today": "2026-09-27"}).json()
+    assert early["sessions"] == [] and "starts Mon 28 Sep" in early["message"]
+
+    due = c.get(f"/goals/{g['id']}/due", params={"today": "2026-09-29"}).json()
+    assert [(s["day"], s["milestone_key"], s["planned_minutes"]) for s in due["sessions"]] == [
+        ("2026-09-28", "basics", 60), ("2026-09-29", "basics", 60)]
+
+    answers = [{"day": s["day"], "milestone_key": s["milestone_key"], "outcome": "done",
+                "planned_minutes": 60, "actual_minutes": 60} for s in due["sessions"]]
+    c.post(f"/goals/{g['id']}/checkins", json={"checkins": answers, "today": "2026-09-29"})
+    assert c.get(f"/goals/{g['id']}").json()["checked_through"] == "2026-09-29"
+
+    again = c.get(f"/goals/{g['id']}/due", params={"today": "2026-09-29"}).json()
+    assert again["sessions"] == [] and "Already checked in" in again["message"]
+    nxt = c.get(f"/goals/{g['id']}/due", params={"today": "2026-09-30"}).json()
+    assert [s["day"] for s in nxt["sessions"]] == ["2026-09-30"]
+
+
+def test_api_reads_and_replan_start(client_with):
+    c = client_with([turn(done=True, deadline="2026-12-01"), BLUEPRINT])
+    g = c.post("/goals", json={"goal": "Learn SQL"}).json()
+    assert c.get(f"/goals/{g['id']}/blueprint").status_code == 404
+    assert c.get(f"/goals/{g['id']}/capacity").status_code == 404
+    c.post(f"/goals/{g['id']}/blueprint")
+    assert len(c.get(f"/goals/{g['id']}/blueprint").json()["milestones"]) == 2
+    slots = [{"weekday": d, "start": "19:00", "end": "20:00"} for d in range(5)]
+    c.put(f"/goals/{g['id']}/capacity", params={"start": "2026-10-05"}, json={"slots": slots})
+    assert c.get(f"/goals/{g['id']}/capacity").json()["slots"][0]["start"] == "19:00:00"
+    # before the plan starts, the plan is shown from its start day
+    assert c.get(f"/goals/{g['id']}/replan", params={"today": "2026-10-01"}).json()["today"] == "2026-10-05"
+    # after checking in through the 6th, it's shown from the 7th
+    c.post(f"/goals/{g['id']}/checkins", json={"checkins": [], "today": "2026-10-06"})
+    assert c.get(f"/goals/{g['id']}/replan", params={"today": "2026-10-06"}).json()["today"] == "2026-10-07"
+
+
+def test_api_cors_allows_frontend(client_with):
+    c = client_with([])
+    res = c.options("/goals", headers={"Origin": "http://localhost:3000",
+                                       "Access-Control-Request-Method": "GET"})
+    assert res.headers.get("access-control-allow-origin") == "http://localhost:3000"
+    bad = c.options("/goals", headers={"Origin": "https://evil.example",
+                                       "Access-Control-Request-Method": "GET"})
+    assert "access-control-allow-origin" not in bad.headers
 
 
 def test_api_bad_ai_output_is_502(client_with):

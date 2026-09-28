@@ -206,3 +206,27 @@ def test_schedule_continues_where_you_left_off():
     assert kinds[0] == TaskKind.practice
     minutes = sum(s.minutes for sp in sched.sprints for d in sp.days for s in d.sessions if s.milestone_key == "a2_build")
     assert minutes == 28 * 60 - 540
+
+
+def test_checkin_script_local_mode(tmp_path, monkeypatch, capsys):
+    import builtins
+    import sys as _sys
+
+    import scripts.checkin as ck
+    from app.core import config, plan_file
+    from app.schemas.interview import GoalProfile
+
+    monkeypatch.setattr(plan_file, "PLAN_PATH", tmp_path / "plan.json")
+    monkeypatch.setattr(config, "SUPABASE_URL", "")
+    monkeypatch.setattr(config, "DATABASE_URL", "")
+    plan_file.save(plan_file.SavedPlan(
+        goal="Kaggle", blueprint=kaggle_blueprint(), capacity=kaggle_week(1.5), start=MON,
+        profile=GoalProfile(key_dates=[{"key": k, "label": k, "date": v} for k, v in KAGGLE_DATES.items()]),
+    ))
+    answers = iter(["p 40", "n"])
+    monkeypatch.setattr(builtins, "input", lambda *_: next(answers))
+    monkeypatch.setattr(_sys, "argv", ["checkin", "2026-09-28"])
+    ck.main()
+    saved = plan_file.load()
+    assert saved.checked_through == MON and saved.checkins[0].actual_minutes == 40
+    assert "this Mac" in capsys.readouterr().out

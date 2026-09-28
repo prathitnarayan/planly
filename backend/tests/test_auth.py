@@ -133,3 +133,43 @@ def test_unsafe_config_refused(monkeypatch):
     monkeypatch.setattr(config, "ALLOW_DEV_AUTH_WITH_DB", False)
     with pytest.raises(RuntimeError, match="no login"):
         config.check_safe_config()
+
+
+# ---------- remembered sign-in for the terminal scripts ----------
+
+def test_session_refreshes_and_rotates(tmp_path, monkeypatch):
+    import json as _json
+    import scripts.session as session
+
+    monkeypatch.setattr(session, "SESSION_PATH", tmp_path / "session.json")
+    monkeypatch.setattr(config, "SUPABASE_URL", URL)
+    monkeypatch.setattr(config, "SUPABASE_ANON_KEY", "anon")
+    monkeypatch.setattr(config, "SUPABASE_JWT_SECRET", SECRET)
+    calls = []
+
+    def fake_auth(path, body):
+        calls.append(path)
+        if path.startswith("token?grant_type=refresh_token"):
+            if body["refresh_token"] == "old-refresh":
+                return {"access_token": hs256(claims()), "refresh_token": "new-refresh"}
+            raise session.SignInError("Invalid Refresh Token")
+        return {"access_token": hs256(claims()), "refresh_token": "fresh-refresh"}
+
+    monkeypatch.setattr(session, "_auth", fake_auth)
+    session._save("me@example.com", "old-refresh")
+
+    assert session.current_user() == (ALICE, "me@example.com")          # no password asked
+    assert _json.loads(session.SESSION_PATH.read_text())["refresh_token"] == "new-refresh"
+
+    session._save("me@example.com", "revoked")                          # e.g. signed out elsewhere
+    monkeypatch.setattr("builtins.input", lambda *_: "me@example.com")
+    monkeypatch.setattr("getpass.getpass", lambda *_: "pw")
+    assert session.current_user()[0] == ALICE                            # fell back to password
+    assert _json.loads(session.SESSION_PATH.read_text())["refresh_token"] == "fresh-refresh"
+    assert oct(session.SESSION_PATH.stat().st_mode)[-3:] == "600"        # only you can read it
+
+    session.sign_out()
+    assert not session.SESSION_PATH.exists()
+    import pytest as _pytest
+    with _pytest.raises(session.SignInError):
+        session.current_user(interactive=False)

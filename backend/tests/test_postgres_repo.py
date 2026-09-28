@@ -34,7 +34,8 @@ def dsn():
     url = _dsn_for(name)
     with psycopg.connect(url, autocommit=True) as conn:
         conn.execute((ROOT / "backend/tests/sql/supabase_stub.sql").read_text())
-        conn.execute((ROOT / "database/migrations/001_planly.sql").read_text())
+        for migration in sorted((ROOT / "database/migrations").glob("*.sql")):   # all, in order
+            conn.execute(migration.read_text())
         from app.core.auth import DEV_USER_ID   # the API test below runs in dev-login mode
         conn.execute("insert into auth.users values (%s), (%s), (%s)", (ALICE, BOB, DEV_USER_ID))
     yield url
@@ -66,6 +67,14 @@ def test_create_get_save_roundtrip(repo):
     repo.save(ALICE, got)
     again = repo.get(ALICE, rec.id)
     assert again.blueprint.total_hours == 20
+
+
+def test_tracking_dates_roundtrip(repo):
+    rec = repo.create(ALICE, interview())
+    rec.plan_start, rec.checked_through = date(2026, 9, 29), date(2026, 10, 1)
+    repo.save(ALICE, rec)
+    got = repo.get(ALICE, rec.id)
+    assert (got.plan_start, got.checked_through) == (date(2026, 9, 29), date(2026, 10, 1))
 
 
 def test_other_user_sees_nothing(repo):
@@ -200,6 +209,7 @@ def test_push_plan_uploads_saved_plan(dsn, repo, tmp_path, monkeypatch):
     assert len(mine) == 1 and mine[0].checkins == 1 and mine[0].has_blueprint and mine[0].has_capacity
     got = repo.get(ALICE, mine[0].id)
     assert got.interview.done and got.interview.profile.key_date_map() == KAGGLE_DATES
+    assert got.plan_start == MON
     assert repo.list(BOB) == [] or all(s.title != "Kaggle 2 and 3" for s in repo.list(BOB))
 
 
@@ -221,3 +231,58 @@ def test_placeholder_password_is_called_out():
     msg = _explain("postgresql://postgres.abcd:[YOUR-PASSWORD]@aws-0-ap-south-1.pooler.supabase.com:5432/postgres")
     assert "placeholder is still in DATABASE_URL" in msg
     assert "Not the Session pooler" not in msg           # it IS the pooler
+
+
+def test_missing_tables_give_a_clear_503(dsn):
+    """Real first run: GET /goals -> bare 500 because the migration hadn't been run."""
+    from fastapi.testclient import TestClient
+    from app.core.repo import PostgresRepo
+    from app.main import app, get_repo
+    empty = _dsn_for("postgres")                     # a database with no Planly tables
+    repo = PostgresRepo(empty, pool_size=1)
+    app.dependency_overrides[get_repo] = lambda: repo
+    try:
+        res = TestClient(app).get("/goals")
+        assert res.status_code == 503
+        assert "001_planly.sql" in res.json()["detail"]
+    finally:
+        repo.close()
+
+
+def test_checkin_script_on_supabase(dsn, repo, monkeypatch):
+    """scripts.checkin against the database: asks about due sessions, stores answers, moves checked_through."""
+    import builtins
+    import sys as _sys
+
+    import scripts.checkin as ck
+    import scripts.session as session
+    from app.core import config
+    from app.schemas.interview import GoalProfile
+    from app.ai.goal_intake import InterviewState
+    from tests.test_planning import KAGGLE_DATES, MON, kaggle_blueprint, kaggle_week
+
+    carol = str(uuid.uuid4())
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute("insert into auth.users values (%s)", (carol,))
+    profile = GoalProfile(key_dates=[{"key": k, "label": k, "date": v} for k, v in KAGGLE_DATES.items()])
+    rec = repo.create(carol, InterviewState(goal="Kaggle", profile=profile, done=True))
+    rec.blueprint, rec.capacity, rec.plan_start = kaggle_blueprint(), kaggle_week(1.5), MON
+    repo.save(carol, rec)
+
+    monkeypatch.setattr(config, "SUPABASE_URL", "https://x.supabase.co")
+    monkeypatch.setattr(config, "DATABASE_URL", dsn)
+    monkeypatch.setattr(session, "current_user", lambda interactive=True: (carol, "carol@example.com"))
+    answers = iter(["", "m", "n"])          # Mon done, Tue missed, "finished?" no
+    monkeypatch.setattr(builtins, "input", lambda *_: next(answers))
+    monkeypatch.setattr(_sys, "argv", ["checkin", "2026-09-29"])
+    ck.main()
+
+    got = repo.get(carol, rec.id)
+    assert got.checked_through == date(2026, 9, 29)
+    assert [(c.day.day, c.outcome) for c in got.checkins] == [(28, "done"), (29, "missed")]
+    assert got.checkins[0].actual_minutes == got.checkins[0].planned_minutes == 72
+
+    # run again the same day: nothing new to ask, nothing stored
+    monkeypatch.setattr(builtins, "input", lambda *_: pytest.fail("shouldn't ask anything"))
+    ck.main()
+    assert len(repo.get(carol, rec.id).checkins) == 2
