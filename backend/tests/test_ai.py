@@ -13,7 +13,6 @@ from app.ai.goal_intake import (
     answer_question, apply_correction, check_goal, generate_blueprint, start_interview,
 )
 from app.ai.llm import LLMOutputError, generate_validated
-from app.core import store
 from app.main import app, get_llm
 from app.schemas.blueprint import GoalBlueprint
 from app.schemas.interview import GoalProfile, InterviewTurn
@@ -214,14 +213,12 @@ def test_blueprint_retry_on_cycle():
 # ---------- API end to end ----------
 
 @pytest.fixture
-def client_with(request):
+def client_with(isolated_app):
     def make(replies):
         fake = FakeLLM(replies)
         app.dependency_overrides[get_llm] = lambda: fake
         return TestClient(app)
-    store.clear()
-    yield make
-    app.dependency_overrides.clear()
+    return make
 
 
 def test_api_goal_to_feasibility(client_with):
@@ -252,10 +249,7 @@ def test_api_goal_to_feasibility(client_with):
     assert r["feasible"] is True
 
 
-def test_api_edit_hours_logs_correction(client_with, tmp_path, monkeypatch):
-    from app.core import estimate_log
-    log = tmp_path / "corrections.jsonl"
-    monkeypatch.setattr(estimate_log, "LOG_PATH", log)
+def test_api_edit_hours_logs_correction(client_with, isolated_app):
     c = client_with([turn(done=True, deadline_status="none",
                           benchmarks=[{"what": "Assignment 1", "hours": 25}]), BLUEPRINT])
     g = c.post("/goals", json={"goal": "Learn SQL"}).json()
@@ -266,17 +260,15 @@ def test_api_edit_hours_logs_correction(client_with, tmp_path, monkeypatch):
     joins = next(m for m in res.json()["milestones"] if m["key"] == "joins")
     assert sum(joins["hours_by_kind"].values()) == 6
 
-    row = json.loads(log.read_text().strip())
+    row = isolated_app.corrections[0]       # the API logs to the database, per user + goal
     assert row["ai_hours"] == 12 and row["user_hours"] == 6 and row["ratio"] == 0.5
-    assert row["had_benchmark"] is True
+    assert row["had_benchmark"] is True and row["source"] == "api" and row["goal_id"] == g["id"]
 
     assert c.patch(f"/goals/{g['id']}/blueprint/milestones/nope", json={"hours": 6}).status_code == 404
     assert c.patch(f"/goals/{g['id']}/blueprint/milestones/joins", json={"hours": 0}).status_code == 422
 
 
-def test_api_estimate_check_and_deliverable_edit(client_with, tmp_path, monkeypatch):
-    from app.core import estimate_log
-    monkeypatch.setattr(estimate_log, "LOG_PATH", tmp_path / "c.jsonl")
+def test_api_estimate_check_and_deliverable_edit(client_with):
     bp = json.loads(json.dumps(BLUEPRINT))
     for m in bp["milestones"]:
         m["deliverable"] = "sql_course"

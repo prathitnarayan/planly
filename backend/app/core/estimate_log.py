@@ -17,7 +17,7 @@ from pathlib import Path
 LOG_PATH = Path(__file__).resolve().parents[2] / "data" / "estimate_corrections.jsonl"
 
 
-def log_correction(
+def make_row(
     goal: str,
     milestone_key: str,
     milestone_name: str,
@@ -25,13 +25,12 @@ def log_correction(
     user_hours: float,
     confidence: float,
     had_benchmark: bool,
-    path: Path | None = None,
     source: str = "user_review",   # "user_review" | "benchmark_check" | "api"
 ) -> dict | None:
-    """Returns the logged row, or None if nothing changed (retyping the same number isn't data)."""
+    """The correction as a dict, or None if nothing changed (retyping the same number isn't data)."""
     if abs(user_hours - ai_hours) < 0.01:
         return None
-    row = {
+    return {
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "goal": goal,
         "milestone_key": milestone_key,       # or a deliverable name
@@ -43,6 +42,24 @@ def log_correction(
         "had_benchmark": had_benchmark,
         "source": source,
     }
+
+
+def log_correction(
+    goal: str,
+    milestone_key: str,
+    milestone_name: str,
+    ai_hours: float,
+    user_hours: float,
+    confidence: float,
+    had_benchmark: bool,
+    path: Path | None = None,
+    source: str = "user_review",
+) -> dict | None:
+    """Terminal scripts: append to data/estimate_corrections.jsonl. (The API logs to the database.)"""
+    row = make_row(goal, milestone_key, milestone_name, ai_hours, user_hours,
+                   confidence, had_benchmark, source)
+    if row is None:
+        return None
     target = path or LOG_PATH
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a") as f:
