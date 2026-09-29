@@ -23,10 +23,11 @@ TEST_DEFAULT = 60
 PRACTICE_MINUTES = {"easy": 20, "medium": 40, "hard": 60, None: 30}
 
 
-def study_minutes(item: SourceItem) -> int | None:
-    """Minutes of real work for one item, or None if it can't be sized honestly."""
+def study_minutes(item: SourceItem, video_factor: float | None = None) -> int | None:
+    """Minutes of real work for one item, or None if it can't be sized honestly.
+    video_factor: the user's learned video pace (planners/learning.py); default 1.5x."""
     if item.kind == "video":
-        return round(item.minutes * VIDEO_FACTOR) if item.minutes else None
+        return round(item.minutes * (video_factor or VIDEO_FACTOR)) if item.minutes else None
     if item.kind == "live":
         return item.minutes
     if item.kind == "reading":

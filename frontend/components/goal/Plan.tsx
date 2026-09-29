@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
+import { Learned } from "@/components/goal/Learned";
 import { Today } from "@/components/goal/Today";
 import { ErrorNote, Loading } from "@/components/ui";
 import { api } from "@/lib/api";
@@ -261,6 +262,7 @@ export function Plan({ goalId, hasCheckins, onEditHours, onEditTime }: {
     <div>
       {today && <Today goalId={goalId} view={today} onChange={setToday} onStarted={load} />}
       <Verdict f={r.feasibility} r={r} onEditTime={onEditTime} onEditHours={onEditHours} />
+      <Learned />
 
       <div className="mb-10 flex flex-wrap gap-2">
         <button onClick={onEditHours} className="h-9 cursor-pointer rounded-full border border-line px-4 text-sm hover:border-ink">Adjust hours</button>

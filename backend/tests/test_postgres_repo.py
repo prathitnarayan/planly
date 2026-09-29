@@ -332,3 +332,30 @@ def test_deleted_account_gets_401_not_500(dsn, monkeypatch):
     finally:
         app.dependency_overrides.pop(current_user, None)
         repo.close()
+
+
+def test_settings_and_outcomes_roundtrip(repo):
+    from app.core.repo import UserSettings
+    from app.planners.capacity import CapacityProfile
+    from app.planners.learning import Learned, Outcome, OutcomeItem, WeekdayStat
+    st = UserSettings(capacity=CapacityProfile(slots=[{"weekday": 0, "start": "19:00", "end": "20:00"}]),
+                      goal_order=["g1"], learned=Learned(weekday={1: WeekdayStat(ratio=0.5, sessions=4)}))
+    repo.save_settings(ALICE, st)
+    got = repo.get_settings(ALICE)
+    assert got.capacity.slots[0].minutes == 60 and got.goal_order == ["g1"] and got.learned.weekday[1].ratio == 0.5
+    assert repo.get_settings(BOB).capacity is None
+    rec = repo.create(ALICE, interview())
+    row = Outcome(day=date(2026, 10, 6), weekday=1, kind="learn", planned_min=60, credited_min=30, ticked=True,
+                  items=[OutcomeItem(kind="video", length_min=20, watched=1.0, active_min=35)])
+    repo.add_outcomes(ALICE, rec.id, [row])
+    rows = repo.list_outcomes(ALICE, date(2026, 10, 1))
+    assert len(rows) == 1 and rows[0].goal_id == rec.id and rows[0].items[0].active_min == 35
+    assert repo.list_outcomes(BOB, date(2026, 10, 1)) == []
+
+
+def test_watch_active_time_adds_up(repo):
+    from app.planners.integrity import WatchEvidence
+    k = "yt:" + "z" * 11
+    repo.merge_watch(ALICE, [WatchEvidence(key=k, duration_s=600, intervals=[(0, 60)], active_s=90)])
+    got = repo.merge_watch(ALICE, [WatchEvidence(key=k, duration_s=600, intervals=[(60, 120)], active_s=100)])
+    assert got[k].active_s == 190

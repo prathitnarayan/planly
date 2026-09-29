@@ -40,8 +40,10 @@ from app.core import web_read
 from app.core.auth import current_user
 from app.core.estimate_log import make_row
 from app.core.repo import (
-    DatabaseUnavailable, GoalRecord, GoalRepo, GoalSummary, InMemoryRepo, PostgresRepo,
+    DatabaseUnavailable, GoalRecord, GoalRepo, GoalSummary, InMemoryRepo, PostgresRepo, UserSettings,
 )
+from app.planners.learning import Learned, learn
+from app.planners.pool import shared_pool_taken
 from app.planners.capacity import CapacityProfile
 from app.planners.estimate_check import EstimateWarning, check_estimates
 from app.planners.load import (
@@ -58,7 +60,7 @@ from app.schemas.blueprint import GoalBlueprint
 from app.schemas.interview import GoalCheck, GoalProfile
 from app.schemas.source import CourseSource, SourceItem, parse_duration
 
-app = FastAPI(title="Planly API", version="0.8.0")
+app = FastAPI(title="Planly API", version="0.9.0")
 
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
@@ -158,6 +160,53 @@ class Ctx:
     def log(self, rec: GoalRecord, row: dict | None) -> None:
         if row:
             self.repo.log_correction(self.user_id, rec.id, row)
+
+    # ---- one pool of free time for all goals + what Planly learned (006) ----
+    _settings: UserSettings | None = None
+    _caps: dict | None = None
+
+    @property
+    def settings(self) -> UserSettings:
+        if self._settings is None:
+            self._settings = self.repo.get_settings(self.user_id)
+        return self._settings
+
+    def save_settings(self) -> None:
+        self.repo.save_settings(self.user_id, self.settings)
+        self._caps = None
+
+    def goal_order(self) -> list[str]:
+        """Priority order: the user's saved order, then any other goals (newest first)."""
+        ids = [g.id for g in self.repo.list(self.user_id)]
+        saved = [g for g in self.settings.goal_order if g in ids]
+        return saved + [g for g in ids if g not in saved]
+
+    def base_capacity(self, rec: GoalRecord) -> CapacityProfile | None:
+        return self.settings.capacity or rec.capacity
+
+    def cap(self, rec: GoalRecord, start: date) -> CapacityProfile | None:
+        """This goal's free time: the shared pool, adjusted by what Planly learned about each
+        weekday, minus the times already planned for higher-priority goals."""
+        base = self.base_capacity(rec)
+        if base is None:
+            return None
+        self._caps = self._caps or {}
+        key = (rec.id, start)
+        if key not in self._caps:
+            learned = base.model_copy(update={"weekday_ratio": self.settings.learned.weekday_ratio(base.sustainable_ratio)})
+            taken = shared_pool_taken(self._higher_goals(rec), learned, start, _items)
+            self._caps[key] = learned.model_copy(update={"taken": taken})
+        return self._caps[key]
+
+    def _higher_goals(self, rec: GoalRecord) -> list[GoalRecord]:
+        out = []
+        for gid in self.goal_order():
+            if gid == rec.id:
+                break
+            h = self.repo.get(self.user_id, gid)
+            if h and h.blueprint and h.plan_start:
+                out.append(h)
+        return out
 
 
 # ---------- views ----------
@@ -421,25 +470,28 @@ def set_capacity(goal_id: str, body: CapacityProfile, start: date | None = None,
     if rec.plan_start is None or start is not None:
         rec.plan_start = start or tomorrow()
     ctx.save(rec)
+    ctx.settings.capacity = body            # one pool of free time, shared by every goal
+    ctx.save_settings()
     return body
 
 
 @app.get("/goals/{goal_id}/capacity", response_model=CapacityProfile)
 def read_capacity(goal_id: str, ctx: Ctx = Depends()) -> CapacityProfile:
     rec = ctx.load(goal_id)
-    if not rec.capacity:
+    cap = ctx.base_capacity(rec)
+    if not cap:
         raise HTTPException(status_code=404, detail="no capacity yet")
-    return rec.capacity
+    return cap
 
 
-def _replan(rec: GoalRecord, checkins: list[CheckIn], today: date) -> ReplanResult:
+def _replan(ctx: "Ctx", rec: GoalRecord, checkins: list[CheckIn], today: date) -> ReplanResult:
     bp = require_blueprint(rec)
     if not rec.capacity:
         raise HTTPException(status_code=409, detail="set capacity first: PUT /goals/{id}/capacity")
     p = rec.interview.profile
     try:
         items = resolve_items(bp, p.key_date_map(), p.deadline, 1.0, p.soft_key_dates(), p.deadline_hard)
-        return replan(bp, items, checkins, rec.capacity, today, penalties=rec.integrity.penalty_minutes)
+        return replan(bp, items, checkins, ctx.cap(rec, today), today, penalties=rec.integrity.penalty_minutes)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -470,7 +522,7 @@ def get_due(goal_id: str, today: date | None = None, ctx: Ctx = Depends()) -> Du
                else f"Already checked in up to {rec.checked_through:%a %d %b}.")
         return DueView(since=since, until=today, sessions=[], message=msg)
     try:
-        sessions = due_sessions(require_blueprint(rec), _items(rec), rec.checkins, rec.capacity, since, today)
+        sessions = due_sessions(require_blueprint(rec), _items(rec), rec.checkins, ctx.cap(rec, since), since, today)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     return DueView(since=since, until=today, sessions=sessions,
@@ -488,7 +540,7 @@ def add_checkins(goal_id: str, body: CheckInBatch, ctx: Ctx = Depends()) -> Repl
     rec = ctx.load(goal_id)
     today = body.today or date.today()
     # Replan FIRST with the new check-ins; only store them if that works (bad batch = nothing saved).
-    result = _replan(rec, rec.checkins + body.checkins, today + timedelta(days=1))
+    result = _replan(ctx, rec, rec.checkins + body.checkins, today + timedelta(days=1))
     if body.checkins:
         ctx.repo.add_checkins(ctx.user_id, rec.id, body.checkins)
     if rec.checked_through is None or today > rec.checked_through:
@@ -519,7 +571,8 @@ def _day_ctx(ctx: "Ctx", rec: GoalRecord) -> DayContext:
     """Courses + standing + the watch evidence for this goal's videos."""
     keys = [k for src in rec.sources for it in src.items if (k := video_key(it.url, it.kind))]
     evidence = ctx.repo.get_watch(ctx.user_id, keys) if keys else {}
-    return DayContext(sources=rec.sources, integrity=rec.integrity, evidence=evidence)
+    return DayContext(sources=rec.sources, integrity=rec.integrity, evidence=evidence,
+                      video_factor=ctx.settings.learned.pace())
 
 
 def _close_past_days(ctx: "Ctx", rec: GoalRecord, today: date) -> None:
@@ -533,8 +586,9 @@ def _close_past_days(ctx: "Ctx", rec: GoalRecord, today: date) -> None:
     if first > last:
         return
     try:
-        new, notes, integrity = close_days(rec.blueprint, _items(rec), rec.checkins, rec.capacity,
-                                           rec.ticks.days, first, last, _day_ctx(ctx, rec), rec.ticks.at)
+        new, notes, integrity, outcomes = close_days(
+            rec.blueprint, _items(rec), rec.checkins, ctx.cap(rec, first),
+            rec.ticks.days, first, last, _day_ctx(ctx, rec), rec.ticks.at)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     if new:
@@ -542,12 +596,23 @@ def _close_past_days(ctx: "Ctx", rec: GoalRecord, today: date) -> None:
         rec.checkins += new
     rec.integrity = integrity
     rec.checked_through = last
+    _learn_from(ctx, rec, outcomes, today)
     keep = lambda sid: sid[:10] > last.isoformat()   # ids start with the ISO day
     rec.ticks.days = {d: ids for d, ids in rec.ticks.days.items() if d > last.isoformat()}
     rec.ticks.at = {k: v for k, v in rec.ticks.at.items() if keep(k)}
     rec.ticks.auto = [k for k in rec.ticks.auto if keep(k)]
     rec.ticks.notes, rec.ticks.notes_day = notes, today
     ctx.save(rec)
+
+
+def _learn_from(ctx: "Ctx", rec: GoalRecord, outcomes, today: date) -> None:
+    """Store what happened, then re-learn this user's pace and reliable days (learning.py)."""
+    if not outcomes:
+        return
+    ctx.repo.add_outcomes(ctx.user_id, rec.id, outcomes)
+    history = ctx.repo.list_outcomes(ctx.user_id, today - timedelta(days=90))
+    ctx.settings.learned = learn(history, today)
+    ctx.save_settings()
 
 
 class Standing(BaseModel):
@@ -582,15 +647,15 @@ def _standing(rec: GoalRecord, today: date) -> Standing:
                     last_day=[e for e in it.events if e.day == last] if last else [])
 
 
-def _next_planned(rec: GoalRecord, after: date, dctx: DayContext) -> tuple[date | None, list[TodaySession]]:
+def _next_planned(ctx: "Ctx", rec: GoalRecord, after: date, dctx: DayContext) -> tuple[date | None, list[TodaySession]]:
     """First day after `after` with sessions, as the plan stands now (preview)."""
     start = max(after + timedelta(days=1), rec.plan_start or after)
-    plan = replan(rec.blueprint, _items(rec), rec.checkins, rec.capacity, today=start,
+    plan = replan(rec.blueprint, _items(rec), rec.checkins, ctx.cap(rec, start), today=start,
                   penalties=rec.integrity.penalty_minutes)
     for sprint in plan.schedule.sprints:
         for d in sprint.days:
             if d.sessions:
-                sessions, _ = day_plan(rec.blueprint, _items(rec), rec.checkins, rec.capacity, d.day, dctx)
+                sessions, _ = day_plan(rec.blueprint, _items(rec), rec.checkins, ctx.cap(rec, start), d.day, dctx)
                 return d.day, sessions
     return None, []
 
@@ -600,7 +665,7 @@ def _today_view(ctx: "Ctx", rec: GoalRecord, today: date, save_auto: bool = True
     view = _today_view_inner(ctx, rec, today, dctx, save_auto)
     if not view.sessions and not view.closed:
         try:
-            view.next_day, view.next_sessions = _next_planned(rec, today, dctx)
+            view.next_day, view.next_sessions = _next_planned(ctx, rec, today, dctx)
         except ValueError:
             pass
     view.standing = _standing(rec, today)
@@ -617,7 +682,7 @@ def _today_view_inner(ctx: "Ctx", rec: GoalRecord, today: date, dctx: DayContext
         return TodayView(day=today, sessions=[], planned_minutes=0, done_minutes=0, moved=moved, closed=True,
                          message="Today is already checked in.")
     try:
-        sessions, _ = day_plan(rec.blueprint, _items(rec), rec.checkins, rec.capacity, today, dctx)
+        sessions, _ = day_plan(rec.blueprint, _items(rec), rec.checkins, ctx.cap(rec, today), today, dctx)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     key = today.isoformat()
@@ -715,14 +780,44 @@ def set_tick(goal_id: str, body: Tick, ctx: Ctx = Depends()) -> TodayView:
     return _today_view(ctx, rec, today, save_auto=False)
 
 
+# ---------- you: shared free time, goal priority, what Planly learned ----------
+
+class LearnedView(BaseModel):
+    learned: Learned
+    notes: list[str]
+    goal_order: list[str]
+    has_shared_capacity: bool
+
+
+@app.get("/me/learned", response_model=LearnedView)
+def me_learned(ctx: Ctx = Depends()) -> LearnedView:
+    st = ctx.settings
+    return LearnedView(learned=st.learned, notes=st.learned.notes(), goal_order=ctx.goal_order(),
+                       has_shared_capacity=st.capacity is not None)
+
+
+class GoalOrder(BaseModel):
+    goal_ids: list[str] = Field(max_length=200)
+
+
+@app.put("/me/goal-order")
+def set_goal_order(body: GoalOrder, ctx: Ctx = Depends()) -> dict:
+    """Priority: the first goal gets first pick of your free time, the next gets what's left..."""
+    mine = {g.id for g in ctx.repo.list(ctx.user_id)}
+    ctx.settings.goal_order = [g for g in body.goal_ids if g in mine]
+    ctx.save_settings()
+    return {"goal_order": ctx.goal_order()}
+
+
 # ---------- evidence from the Chrome extension ----------
 
 class WatchEvent(BaseModel):
     key: str = Field(pattern=r"^(yt:[A-Za-z0-9_-]{11}|page:.{1,500})$")
     url: str | None = Field(default=None, max_length=2000)
     title: str | None = Field(default=None, max_length=300)
-    duration_s: float = Field(gt=0, le=24 * 3600)
+    duration_s: float = Field(ge=0, le=24 * 3600)   # 0 = unknown (page time only)
     intervals: list[tuple[float, float]] = Field(max_length=500)
+    active_s: float = Field(default=0, ge=0, le=6 * 3600)   # page time since the last report
 
 
 class WatchBatch(BaseModel):
@@ -768,7 +863,7 @@ def get_replan(goal_id: str, today: date | None = None, ctx: Ctx = Depends()) ->
         start = rec.plan_start
     if rec.checked_through and rec.checked_through >= start:
         start = rec.checked_through + timedelta(days=1)
-    return _replan(rec, rec.checkins, start)
+    return _replan(ctx, rec, rec.checkins, start)
 
 
 # ---------- courses: synced from the real course pages by backend/sync ----------

@@ -11,6 +11,7 @@
   const TOP = window === window.top;
   const MAX_RATE = 2.0;
   const states = new Map();          // video element -> { key, segStart, lastT }
+  let lastPlayed = null;             // the video most recently playing (for page time)
   let pending = {};                  // key -> { key, url, title, duration_s, intervals: [] }
   let index = 0;
 
@@ -56,6 +57,7 @@
     const t = video.currentTime;
     if (key !== st.key) { close(video, st); st.key = key; }            // YouTube moved to the next video
     if (!counting) { close(video, st); st.lastT = t; return; }
+    lastPlayed = video;
     if (st.segStart == null) { st.segStart = t; st.lastT = t; return; }
     if (t < st.lastT - 0.5 || t - st.lastT > 3 * Math.max(1, video.playbackRate)) {   // seek
       close(video, st);
@@ -80,7 +82,7 @@
     for (const [video, st] of states) {                               // include the running segment
       if (st.segStart != null) { close(video, st); if (!video.paused) st.segStart = video.currentTime; }
     }
-    const events = Object.values(pending).filter((e) => e.intervals.length);
+    const events = Object.values(pending).filter((e) => e.intervals.length || e.active_s > 0);
     pending = {};
     if (events.length) {
       try { chrome.runtime.sendMessage({ type: "watch", events }); } catch {}
@@ -89,6 +91,33 @@
   setInterval(flush, 20000);
   document.addEventListener("visibilitychange", () => { states.forEach((st, v) => tick(v)); flush(); });
   window.addEventListener("pagehide", flush);
+
+  // ---------- real time on the lecture page (top frame only, so embeds aren't counted twice) ----------
+  // Counted while the tab is visible and focused, and something is happening (a video playing,
+  // or you touched the page in the last 5 minutes). Pauses for notes count; a forgotten tab doesn't.
+  // This is how Planly learns your real video pace (pauses, notes, rewinds included).
+  if (TOP) {
+    let lastInput = Date.now();
+    for (const ev of ["mousemove", "keydown", "scroll", "click", "touchstart"]) {
+      window.addEventListener(ev, () => { lastInput = Date.now(); }, { passive: true, capture: true });
+    }
+    const pageVideo = () => {
+      const own = lastPlayed || document.querySelector("video");
+      if (own && Number.isFinite(own.duration)) return { key: keyFor(own), duration: own.duration };
+      const f = [...document.querySelectorAll("iframe[src]")].find((x) => ytId(x.src));
+      return f ? { key: "yt:" + ytId(f.src), duration: 0 } : null;
+    };
+    setInterval(() => {
+      if (document.visibilityState !== "visible" || !document.hasFocus()) return;
+      const playing = [...document.querySelectorAll("video")].some((v) => !v.paused && !v.ended);
+      if (!playing && Date.now() - lastInput > 5 * 60 * 1000) return;
+      const v = pageVideo();
+      if (!v) return;
+      const p = (pending[v.key] ||= { key: v.key, url: location.href.slice(0, 2000), title: title(),
+                                      duration_s: Math.min(v.duration || 0, 86400), intervals: [] });
+      p.active_s = (p.active_s || 0) + 5;
+    }, 5000);
+  }
 
   if (TOP) setTimeout(() => startBar(), 1500);
 

@@ -41,7 +41,7 @@ def test_missed_day_is_spread_not_piled_onto_tomorrow():
     day1 = minutes_on(MON, [])
     assert sum(s.minutes for s in day1) == 60
     assert day1[0].id == f"{MON.isoformat()}|basics|learn|0" and day1[0].kind == "learn"
-    new, notes, _ = close_days(BP, ITEMS, [], CAP, {}, MON, MON)          # nothing ticked
+    new, notes, _, _ = close_days(BP, ITEMS, [], CAP, {}, MON, MON)          # nothing ticked
     assert [(c.outcome, c.actual_minutes) for c in new] == [("missed", 0)]
     assert "spread over the next days" in notes[0]
     day2 = minutes_on(MON + timedelta(days=1), new)
@@ -52,7 +52,7 @@ def test_missed_day_is_spread_not_piled_onto_tomorrow():
 def test_ticked_work_counts_and_the_plan_moves_on():
     day1 = minutes_on(MON, [])
     ticks = {MON.isoformat(): [s.id for s in day1]}
-    new, notes, _ = close_days(BP, ITEMS, [], CAP, ticks, MON, MON)
+    new, notes, _, _ = close_days(BP, ITEMS, [], CAP, ticks, MON, MON)
     assert [(c.outcome, c.actual_minutes) for c in new] == [("done", 60)] and notes == []
 
 
@@ -62,14 +62,14 @@ def test_partial_when_some_sessions_ticked():
     s1, _ = day_plan(BP, ITEMS, [], cap, MON)
     assert {s.milestone_key for s in s1} == {"basics", "joins"}
     ticks = {MON.isoformat(): [s.id for s in s1 if s.milestone_key == "basics"]}
-    new, notes, _ = close_days(BP, ITEMS, [], cap, ticks, MON, MON)
+    new, notes, _, _ = close_days(BP, ITEMS, [], cap, ticks, MON, MON)
     out = {c.milestone_key: (c.outcome, c.milestone_complete) for c in new}
     assert out == {"basics": ("done", True), "joins": ("missed", False)}   # last piece ticked = finished
     assert len(notes) == 1 and "Joins" in notes[0]
 
 
 def test_days_are_closed_one_by_one_against_that_days_plan():
-    new, notes, _ = close_days(BP, ITEMS, [], CAP, {}, MON, MON + timedelta(days=2))
+    new, notes, _, _ = close_days(BP, ITEMS, [], CAP, {}, MON, MON + timedelta(days=2))
     assert [c.day for c in new] == [MON, MON + timedelta(days=1), MON + timedelta(days=2)]
     assert all(c.outcome == "missed" for c in new) and len(notes) == 3
 

@@ -57,6 +57,7 @@ class WatchEvidence(BaseModel):
     title: str | None = None
     duration_s: float
     intervals: list[tuple[float, float]] = Field(default_factory=list)   # played media ranges (seconds)
+    active_s: float = 0.0                     # real time on the page with this video (pauses included)
     updated_at: datetime | None = None
 
 
@@ -80,6 +81,8 @@ def merge_intervals(ranges: list[tuple[float, float]], duration: float | None = 
 
 def coverage(ev: WatchEvidence, part_from: float = 0.0, part_to: float = 1.0) -> float:
     """Share of the planned part of the video that was actually played (0..1)."""
+    if ev.duration_s <= 0:
+        return 0.0                  # length unknown (e.g. only page time was reported): proves nothing
     lo, hi = part_from * ev.duration_s, part_to * ev.duration_s
     if hi <= lo:
         return 1.0

@@ -26,6 +26,7 @@ from app.planners.capacity import CapacityProfile
 from app.planners.progress import CheckIn
 from app.schemas.blueprint import GoalBlueprint
 from app.planners.integrity import Integrity, WatchEvidence, merge_intervals
+from app.planners.learning import Learned, Outcome
 from app.schemas.source import CourseSource
 
 
@@ -55,6 +56,13 @@ class GoalRecord(BaseModel):
         return self.interview.goal
 
 
+class UserSettings(BaseModel):
+    """Per user, across all goals (006)."""
+    capacity: CapacityProfile | None = None     # ONE pool of free time shared by every goal
+    goal_order: list[str] = Field(default_factory=list)   # priority: first goal plans first
+    learned: Learned = Field(default_factory=Learned)     # how this user really works (learning.py)
+
+
 class GoalSummary(BaseModel):
     id: str
     title: str
@@ -74,6 +82,10 @@ class GoalRepo(Protocol):
     def log_correction(self, user_id: str, goal_id: str | None, row: dict) -> None: ...
     def delete(self, user_id: str, goal_id: str) -> bool: ...
     def merge_watch(self, user_id: str, events: list[WatchEvidence]) -> dict[str, WatchEvidence]: ...
+    def get_settings(self, user_id: str) -> UserSettings: ...
+    def save_settings(self, user_id: str, settings: UserSettings) -> None: ...
+    def add_outcomes(self, user_id: str, goal_id: str, rows: list[Outcome]) -> None: ...
+    def list_outcomes(self, user_id: str, since: date) -> list[Outcome]: ...
     def get_watch(self, user_id: str, keys: list[str]) -> dict[str, WatchEvidence]: ...
 
 
@@ -83,7 +95,9 @@ def _merged(old: WatchEvidence | None, ev: WatchEvidence) -> WatchEvidence:
     ranges = (old.intervals if old else []) + ev.intervals
     return WatchEvidence(key=ev.key, url=ev.url or (old.url if old else None),
                          title=ev.title or (old.title if old else None), duration_s=duration,
-                         intervals=merge_intervals(ranges, duration), updated_at=datetime.now(timezone.utc))
+                         intervals=merge_intervals(ranges, duration),
+                         active_s=(old.active_s if old else 0.0) + ev.active_s,   # time adds up, ranges union
+                         updated_at=datetime.now(timezone.utc))
 
 
 def _valid_uuid(value: str) -> bool:
@@ -102,6 +116,20 @@ class InMemoryRepo:
         self._updated: dict[tuple[str, str], datetime] = {}
         self.corrections: list[dict] = []
         self.watch: dict[tuple[str, str], WatchEvidence] = {}
+        self.settings: dict[str, UserSettings] = {}
+        self.outcomes: list[tuple[str, Outcome]] = []
+
+    def get_settings(self, user_id):
+        return (self.settings.get(user_id) or UserSettings()).model_copy(deep=True)
+
+    def save_settings(self, user_id, settings):
+        self.settings[user_id] = settings.model_copy(deep=True)
+
+    def add_outcomes(self, user_id, goal_id, rows):
+        self.outcomes += [(user_id, r.model_copy(update={"goal_id": goal_id})) for r in rows]
+
+    def list_outcomes(self, user_id, since):
+        return [o.model_copy() for u, o in self.outcomes if u == user_id and o.day >= since]
 
     def merge_watch(self, user_id, events):
         out = {}
@@ -320,12 +348,13 @@ class PostgresRepo:
             return {}
         with self.pool.connection() as conn:
             rows = conn.execute(
-                """select video_key, url, title, duration_s, intervals, updated_at
+                """select video_key, url, title, duration_s, intervals, updated_at, active_s
                    from public.watch_evidence where user_id = %s and video_key = any(%s)""",
                 (user_id, list(keys)),
             ).fetchall()
         return {r[0]: WatchEvidence(key=r[0], url=r[1], title=r[2], duration_s=r[3],
-                                    intervals=[tuple(x) for x in (r[4] or [])], updated_at=r[5]) for r in rows}
+                                    intervals=[tuple(x) for x in (r[4] or [])], updated_at=r[5],
+                                    active_s=r[6] or 0.0) for r in rows}
 
     def merge_watch(self, user_id, events):
         from psycopg.types.json import Jsonb
@@ -336,13 +365,51 @@ class PostgresRepo:
                 m = _merged(old.get(ev.key), ev)
                 old[ev.key] = out[ev.key] = m
                 conn.execute(
-                    """insert into public.watch_evidence (user_id, video_key, url, title, duration_s, intervals, updated_at)
-                       values (%s, %s, %s, %s, %s, %s, now())
+                    """insert into public.watch_evidence (user_id, video_key, url, title, duration_s, intervals, active_s, updated_at)
+                       values (%s, %s, %s, %s, %s, %s, %s, now())
                        on conflict (user_id, video_key) do update set url = excluded.url, title = excluded.title,
-                         duration_s = excluded.duration_s, intervals = excluded.intervals, updated_at = now()""",
-                    (user_id, m.key, m.url, m.title, m.duration_s, Jsonb([list(x) for x in m.intervals])),
+                         duration_s = excluded.duration_s, intervals = excluded.intervals,
+                         active_s = excluded.active_s, updated_at = now()""",
+                    (user_id, m.key, m.url, m.title, m.duration_s, Jsonb([list(x) for x in m.intervals]), m.active_s),
                 )
         return out
+
+    def get_settings(self, user_id):
+        with self.pool.connection() as conn:
+            row = conn.execute("select capacity, goal_order, learned from public.user_settings where user_id = %s",
+                               (user_id,)).fetchone()
+        if not row:
+            return UserSettings()
+        return UserSettings(capacity=CapacityProfile.model_validate(row[0]) if row[0] else None,
+                            goal_order=row[1] or [], learned=Learned.model_validate(row[2] or {}))
+
+    def save_settings(self, user_id, settings):
+        from psycopg.types.json import Jsonb
+        with self.pool.connection() as conn:
+            conn.execute(
+                """insert into public.user_settings (user_id, capacity, goal_order, learned, updated_at)
+                   values (%s, %s, %s, %s, now())
+                   on conflict (user_id) do update set capacity = excluded.capacity,
+                     goal_order = excluded.goal_order, learned = excluded.learned, updated_at = now()""",
+                (user_id, self._json(settings.capacity), Jsonb(settings.goal_order), self._json(settings.learned)),
+            )
+
+    def add_outcomes(self, user_id, goal_id, rows):
+        if not rows:
+            return
+        with self.pool.connection() as conn, conn.cursor() as cur:
+            cur.executemany(
+                "insert into public.outcomes (user_id, goal_id, day, data) values (%s, %s, %s, %s)",
+                [(user_id, goal_id, r.day, self._json(r)) for r in rows],
+            )
+
+    def list_outcomes(self, user_id, since):
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "select goal_id, data from public.outcomes where user_id = %s and day >= %s order by day",
+                (user_id, since),
+            ).fetchall()
+        return [Outcome.model_validate({**r[1], "goal_id": str(r[0]) if r[0] else None}) for r in rows]
 
     def close(self) -> None:
         self.pool.close()

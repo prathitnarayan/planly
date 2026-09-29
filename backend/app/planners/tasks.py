@@ -79,7 +79,7 @@ def _verify_kind(src: CourseSource, url: str | None, kind: str = "video") -> str
 
 def attach_items(
     sessions: list, sources: list[CourseSource], done_keys: set[str],
-    part_done: dict[str, float] | None = None,
+    part_done: dict[str, float] | None = None, video_factor: float | None = None,
 ) -> list[list[SessionItem]]:
     """For each session (chronological), the course items it covers. `sessions` need
     .kind and .minutes. `part_done`: items already credited up to a fraction (a long video
@@ -88,7 +88,7 @@ def attach_items(
     queues: dict[str, list[tuple[CourseSource, int]]] = {g: [] for g in KIND_MAP}
     for src in sources:
         for i, it in enumerate(src.items):
-            if it.done or item_key(src, i) in done_keys or study_minutes(it) is None:
+            if it.done or item_key(src, i) in done_keys or study_minutes(it, video_factor) is None:
                 continue
             for group, kinds in KIND_MAP.items():
                 if it.kind in kinds:
@@ -105,7 +105,7 @@ def attach_items(
             src, i = q[0]
             it = src.items[i]
             key = item_key(src, i)
-            total = float(study_minutes(it) or 0)
+            total = float(study_minutes(it, video_factor) or 0)
             rem = left.get(key, total * (1 - min(0.999, part_done.get(key, 0.0))))
             take = min(fill, rem)
             if rem - take < MIN_FRAGMENT:        # don't leave a 3-minute scrap for tomorrow

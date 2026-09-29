@@ -38,6 +38,16 @@ class CapacityProfile(BaseModel):
     fallback_ratio: float = Field(default=0.5, gt=0, le=1)
     # One-off exceptions: {date: minutes available that day}
     overrides: dict[date, int] = Field(default_factory=dict)
+    # ---- computed per request, never saved ----
+    # Learned from the user's own ticks: the share of free time they really use on each weekday
+    # (0 = Monday). Replaces sustainable_ratio for that weekday. (planners/learning.py)
+    weekday_ratio: dict[int, float] = Field(default_factory=dict, exclude=True)
+    # Time already planned for higher-priority goals: {date: [(start, end, minutes)]}.
+    # One pool of free time is shared by all goals; lower goals get what's left. (planners/pool.py)
+    taken: dict[date, list[tuple[time | None, time | None, int]]] = Field(default_factory=dict, exclude=True)
+
+    def taken_minutes(self, day: date) -> int:
+        return sum(m for _, _, m in self.taken.get(day, []))
 
     def max_minutes_on(self, day: date) -> int:
         if day in self.overrides:
@@ -48,8 +58,11 @@ class CapacityProfile(BaseModel):
         """scale > 1 simulates 'what if I had more free time' (used by the options search)."""
         # Overrides are what the user said they have — don't discount them again.
         if day in self.overrides:
-            return int(self.overrides[day] * scale)
-        return int(self.max_minutes_on(day) * self.sustainable_ratio * scale)
+            base = int(self.overrides[day] * scale)
+        else:
+            ratio = self.weekday_ratio.get(day.weekday(), self.sustainable_ratio)
+            base = int(self.max_minutes_on(day) * ratio * scale)
+        return max(0, base - self.taken_minutes(day))
 
     def weekly_summary(self) -> dict[str, float]:
         """Hours per week at each level, ignoring one-off overrides."""

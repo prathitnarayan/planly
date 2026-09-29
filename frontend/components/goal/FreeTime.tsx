@@ -72,7 +72,9 @@ export function FreeTime({ goalId, firstTime, onSaved }: { goalId: string; first
   return (
     <form onSubmit={save}>
       <p className="mb-2 text-xl">When are you free?</p>
-      <p className="mb-6 text-sm text-muted">Be honest, not hopeful. Planly plans on 80% of this, so a bad day doesn&apos;t sink the week.</p>
+      <p className="mb-2 text-sm text-muted">Be honest, not hopeful. Planly plans on 80% of this, so a bad day doesn&apos;t sink the week.</p>
+      <p className="mb-6 text-sm text-muted">This is your free time for <strong className="text-ink">all</strong> your goals: they share it,
+        and the one higher on your goals list gets first pick. Changing it here changes it for every goal.</p>
 
       <div className="mb-2 grid grid-cols-[3rem_1fr_1fr] gap-x-3 text-xs font-medium uppercase tracking-wider text-muted">
         <span /> <span>Hours</span> <span>From</span>

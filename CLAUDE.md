@@ -34,6 +34,10 @@ backend/app/
                          day_plan/close_days: Today checkboxes -> VERIFIED check-ins, one per milestone per closed day
   planners/tasks.py      sessions -> concrete lectures/problems (learn→videos, practice→problems), long videos split
   planners/integrity.py  evidence vs ticks: verified / partial / self / mismatch; trust, streak, owed minutes, locks
+  planners/learning.py   Outcome rows (one per planned session of each closed day) -> learned weekday reliability
+                         + video pace (real page time / video watched); recency-weighted, shrunk to defaults
+  planners/pool.py       ONE pool of free time for all goals: goals plan in priority order, lower goals get the
+                         leftover time (exact times cut out of their slots via CapacityProfile.taken)
   core/plan_file.py      TEMP: one saved plan in data/plan.json for the terminal scripts
   ai/llm.py              LLMClient, OpenAIClient, generate_validated (validate + 1 retry)
   ai/prompts.py          all prompts
@@ -57,7 +61,8 @@ extension/               Chrome MV3: per-site ON via optional_host_permissions (
                          background.js POSTs /sources/page and auto-re-syncs watched pages (<= every 6h)
 frontend/components/goal/Courses.tsx  "Your courses" panel: load per course, items by section, add by link
 backend/tests/           pytest; every planner function gets tests
-database/migrations/     001..005, run in order (002 tracking dates, 003 sources, 004 ticks, 005 integrity + watch_evidence).
+database/migrations/     001..006, run in order (002 dates, 003 sources, 004 ticks, 005 integrity + watch_evidence,
+                         006 user_settings (shared capacity, goal order, learned) + outcomes + watch_evidence.active_s).
                          001_planly.sql — goals (JSONB docs) + append-only checkins / estimate_corrections, RLS
 docs/SUPABASE_SETUP.md   step-by-step connection guide
 docs/normalized_schema_future.sql  NOT applied — future row-per-milestone design
@@ -150,6 +155,10 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
       ticked = done, some = partial, none = missed; last planned piece ticked = milestone complete.
 - [x] Verification (API 0.8.0): lecture-level tasks, extension watch tracking + on-page bar, auto-tick at 80%,
       strict consequences (no credit, +25% owed, trust, streak, evidence-only mode, 3-in-7 lock). 005_integrity.sql
+- [x] Learning stage 1 + shared time pool (API 0.9.0, 006_learning.sql): weekday reliability & video pace learned
+      nightly from outcomes and used in planning; goals share one capacity in priority order (/me/goal-order)
+- [ ] Learning stage 2 (crowd priors per course item) and 3 (model); long-haul mode (phases, rolling detail,
+      revision cycles, books, mock scores, fixed daily blocks)
 - [ ] Codeforces/LeetCode solved via their APIs (stronger practice evidence); trust per user instead of per goal
 - Later: web research, PDF parsing, ML duration model, what-if simulation
 
@@ -162,6 +171,16 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
 - Frontend calls /today BEFORE /replan (sequentially) so a day is closed exactly once.
 - A day with nothing to tick (plan starts later / free day) shows "Next up" (preview, hatched boxes) and,
   before the plan starts, "Start today instead" (POST /start-today; only if nothing is logged yet).
+
+## Learning + shared pool rules
+- Learned numbers only kick in with enough evidence (3 sessions per weekday, 3 lectures for pace) and are
+  pulled towards the defaults; recency is relative to the newest sample (half-life 14 days).
+- The weekday ratio replaces sustainable_ratio for that weekday (0.8 x share really done), clamped 0.3-1.0.
+- CapacityProfile.weekday_ratio / .taken are computed per request (exclude=True) and never saved.
+- The shared capacity lives in user_settings; saving free time on any goal saves it for all goals.
+  The goal's own capacity is only the fallback for accounts from before 006.
+- Page time (active_s) only counts in the top frame, while the tab is visible + focused and a video plays or
+  the page was touched in the last 5 min. Evidence with unknown length (duration 0) proves nothing.
 
 ## Verification rules
 - A penalty needs PROOF: video opened in tracked Chrome but < 50% of the planned part played, or the site

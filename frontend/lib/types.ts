@@ -206,3 +206,11 @@ export type TodayView = {
   next_day: string | null; next_sessions: TodaySession[]; can_start_today: boolean;
   watched: Record<string, number>; standing: Standing | null;
 };
+
+export type LearnedView = {
+  learned: {
+    weekday: Record<string, { ratio: number; sessions: number }>;
+    video_factor: number | null; video_samples: number; outcomes: number; updated: string | null;
+  };
+  notes: string[]; goal_order: string[]; has_shared_capacity: boolean;
+};

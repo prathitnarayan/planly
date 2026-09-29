@@ -134,11 +134,28 @@ def _merge_small(chunks: list[tuple[str, TaskKind, float]]) -> list[tuple[str, T
     return [tuple(c) for c in out]
 
 
+def _free_windows(slots, taken) -> list[list]:
+    """Slot windows minus times already used by higher-priority goals -> [[start, minutes]]."""
+    busy = sorted((a, b) for a, b, _ in taken if a is not None and b is not None)
+    out = []
+    for s in slots:
+        cur, end = s.start, s.end
+        for a, b in busy:
+            if b <= cur or a >= end:
+                continue
+            if a > cur:
+                out.append([cur, _minutes_between(cur, a)])
+            cur = max(cur, b)
+        if cur < end:
+            out.append([cur, _minutes_between(cur, end)])
+    return [w for w in out if w[1] > 0]
+
+
 def _place_in_slots(day: date, chunks, profile: CapacityProfile, items_by_key, deliverable_of):
     """chunks: [(milestone_key, kind, minutes)] -> timed sessions, earliest slot first."""
     slots = sorted((s for s in profile.slots if s.weekday == day.weekday()), key=lambda s: s.start)
     use_times = bool(slots) and day not in profile.overrides
-    free = [[s.start, s.minutes] for s in slots] if use_times else []
+    free = _free_windows(slots, profile.taken.get(day, [])) if use_times else []
     sessions = []
     for key, kind, minutes in chunks:
         minutes = round(minutes)

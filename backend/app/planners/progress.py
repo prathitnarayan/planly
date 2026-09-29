@@ -32,8 +32,9 @@ from pydantic import BaseModel, Field, model_validator
 from app.planners.capacity import CapacityProfile
 from app.planners.feasibility import FeasibilityResult, PlanItem, check_items
 from app.planners.integrity import (
-    Integrity, SiteState, WatchEvidence, apply_day, check_session, checkable,
+    Integrity, SiteState, WatchEvidence, apply_day, check_session, checkable, coverage,
 )
+from app.planners.learning import Outcome, OutcomeItem
 from app.planners.tasks import SessionItem, attach_items, item_key
 from app.schemas.source import CourseSource
 from app.planners.scheduler import Schedule, build_schedule
@@ -262,6 +263,7 @@ class DayContext(BaseModel):
     sources: list[CourseSource] = Field(default_factory=list)
     integrity: Integrity = Field(default_factory=Integrity)
     evidence: dict[str, WatchEvidence] = Field(default_factory=dict)
+    video_factor: float | None = None     # learned video pace (planners/learning.py)
 
     def sites(self) -> dict[str, SiteState]:
         out = {}
@@ -301,7 +303,7 @@ def day_plan(blueprint, items, checkins, capacity, day: date,
                 later |= {s.milestone_key for s in d.sessions}
     if ctx.sources and sessions:
         for s, its in zip(sessions, attach_items(sessions, ctx.sources, set(ctx.integrity.items_done),
-                                              ctx.integrity.items_part)):
+                                              ctx.integrity.items_part, ctx.video_factor)):
             s.items = its
             s.checkable = checkable(its)
     return sessions, later
@@ -311,26 +313,29 @@ def close_days(
     blueprint, items, checkins: list[CheckIn], capacity, ticks: dict[str, list[str]],
     first: date, last: date, ctx: DayContext | None = None,
     ticked_at: dict[str, datetime] | None = None,
-) -> tuple[list[CheckIn], list[str], Integrity]:
+) -> tuple[list[CheckIn], list[str], Integrity, list[Outcome]]:
     """Turn ticks on days first..last (inclusive) into VERIFIED check-ins, one day at a time,
     so each day is judged against the plan the user actually saw that morning.
-    Returns (new check-ins, plain-language notes, updated integrity)."""
+    Returns (new check-ins, plain-language notes, updated integrity, outcomes to learn from)."""
     ctx = (ctx or DayContext()).model_copy()
     sites = ctx.sites()
     new: list[CheckIn] = []
     notes: list[str] = []
+    outcomes: list[Outcome] = []
     day = max(first, last - timedelta(days=MAX_DAYS_TO_CLOSE - 1))
     while day <= last:
         sessions, later = day_plan(blueprint, items, checkins + new, capacity, day, ctx)
         ticked = set(ticks.get(day.isoformat(), []))
         results = []
         credit: dict[str, int] = {}
+        verdict_by: dict[str, str] = {}
         for s in sessions:
             if s.id not in ticked:
                 continue
             chk = check_session(s.minutes, s.items, ctx.evidence, sites,
                                 (ticked_at or {}).get(s.id), ctx.integrity.trust)
             credit[s.id] = chk.credit_minutes
+            verdict_by[s.id] = chk.verdict
             results.append((s.milestone_key, s.milestone_name, chk, s.items))
             if chk.verdict in ("mismatch", "partial"):   # (the verdict itself is shown from integrity events)
                 notes.append(f"{day:%a %d %b}: {s.minutes - chk.credit_minutes} min of {s.milestone_name} "
@@ -351,6 +356,24 @@ def close_days(
             if unticked:
                 notes.append(f"{day:%a %d %b}: {unticked} min of {ss[0].milestone_name} not done "
                              "— spread over the next days.")
+        for s in sessions:
+            outcomes.append(_outcome(s, day, credit.get(s.id, 0), s.id in ticked,
+                                     verdict_by.get(s.id), ctx.evidence))
         ctx.integrity = apply_day(ctx.integrity, day, results, anything_planned=bool(sessions))
         day += timedelta(days=1)
-    return new, notes, ctx.integrity
+    return new, notes, ctx.integrity, outcomes
+
+
+def _outcome(s: TodaySession, day: date, credited: int, ticked: bool, verdict: str | None,
+             evidence: dict[str, WatchEvidence]) -> Outcome:
+    """One row of what happened, for learning. Video pace samples only from whole videos."""
+    items = []
+    for it in s.items:
+        ev = evidence.get(it.video_key) if it.video_key else None
+        if ev and it.part_to >= 0.999 and ev.duration_s > 0:
+            items.append(OutcomeItem(kind=it.kind, length_min=round(ev.duration_s / 60, 2),
+                                     watched=round(coverage(ev), 3), active_min=round(ev.active_s / 60, 2)))
+        else:
+            items.append(OutcomeItem(kind=it.kind, length_min=it.length_minutes))
+    return Outcome(day=day, weekday=day.weekday(), start=s.start, kind=s.kind, planned_min=s.minutes,
+                   credited_min=credited, ticked=ticked, verdict=verdict, items=items)
