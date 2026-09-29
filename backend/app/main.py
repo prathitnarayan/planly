@@ -90,6 +90,17 @@ try:  # only when Postgres support is installed
                       "file in database/migrations/ you haven't run yet (e.g. 002_tracking.sql).",
             "error": str(exc).splitlines()[0],
         })
+    @app.exception_handler(pg_errors.ForeignKeyViolation)
+    async def account_gone(_: Request, exc: Exception) -> JSONResponse:
+        """Real incident (29 Sep): a user was deleted in Supabase Auth while their browser still held
+        a valid token (tokens live up to an hour). Saving anything then broke the user_id link -> 500.
+        Tell the app to sign out instead."""
+        if "user_id" in str(exc):
+            return JSONResponse(status_code=401, content={
+                "detail": "This login belongs to an account that no longer exists. Sign in again.",
+                "code": "account_gone",
+            })
+        return JSONResponse(status_code=409, content={"detail": "That refers to something that doesn't exist."})
 except ImportError:  # pragma: no cover
     pass
 

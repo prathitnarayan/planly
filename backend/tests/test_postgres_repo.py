@@ -309,3 +309,26 @@ def test_integrity_and_tick_times_roundtrip(repo):
     got = repo.get(ALICE, rec.id)
     assert (got.integrity.trust, got.integrity.penalty_minutes, got.integrity.items_part) == (70, {"a": 15}, {"x:1": 0.5})
     assert got.ticks.at["2026-10-05|a|learn|0"].year == 2026
+
+
+def test_deleted_account_gets_401_not_500(dsn, monkeypatch):
+    """Real incident: a user deleted in Supabase Auth still had a valid token -> FK error -> 500."""
+    import uuid as _uuid
+
+    from fastapi.testclient import TestClient
+
+    from app.core import auth as auth_mod
+    from app.core.repo import PostgresRepo
+    from app.main import app, current_user, get_llm, get_repo
+    from tests.test_ai import FakeLLM, turn
+    ghost = str(_uuid.uuid4())                      # not in auth.users
+    repo = PostgresRepo(dsn, pool_size=1)
+    app.dependency_overrides[get_repo] = lambda: repo
+    app.dependency_overrides[current_user] = lambda: ghost
+    app.dependency_overrides[get_llm] = lambda: FakeLLM([turn("q?")])
+    try:
+        r = TestClient(app).post("/goals", json={"goal": "x"})
+        assert r.status_code == 401 and r.json()["code"] == "account_gone"
+    finally:
+        app.dependency_overrides.pop(current_user, None)
+        repo.close()

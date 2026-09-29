@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import { DeleteGoal } from "@/components/goal/DeleteGoal";
 import { ErrorNote, Loading, PageTitle } from "@/components/ui";
 import { api } from "@/lib/api";
 import type { GoalSummary } from "@/lib/types";
@@ -38,14 +39,16 @@ export default function Goals() {
 
       <ul className="divide-y divide-line border-y border-line">
         {goals?.map((g) => (
-          <li key={g.id}>
-            <Link href={`/goals/${g.id}`} className="group flex items-center justify-between gap-4 py-4">
-              <span>
-                <span className="block font-medium group-hover:underline underline-offset-4">{g.title}</span>
+          <li key={g.id} className="flex items-center gap-2">
+            <Link href={`/goals/${g.id}`} className="group flex min-w-0 flex-1 items-center justify-between gap-4 py-4">
+              <span className="min-w-0">
+                <span className="block truncate font-medium group-hover:underline underline-offset-4">{g.title}</span>
                 <span className="text-xs text-muted">{stage(g)}</span>
               </span>
               <span aria-hidden className="text-muted group-hover:text-ink">→</span>
             </Link>
+            <DeleteGoal compact goalId={g.id} title={g.title}
+                        onDeleted={() => setGoals((gs) => (gs ?? []).filter((x) => x.id !== g.id))} />
           </li>
         ))}
       </ul>

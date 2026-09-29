@@ -38,6 +38,13 @@ export async function api<T>(path: string, init: { method?: string; body?: unkno
       const data = await res.json();
       msg = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail ?? data);
     } catch {}
+    if (res.status === 401 && supabase) {
+      // expired / revoked / deleted account: drop the stale session and go to the login page
+      await supabase.auth.signOut().catch(() => {});
+      if (typeof window !== "undefined" && !window.location.pathname.startsWith("/login")) {
+        window.location.href = `/login?reason=${encodeURIComponent(msg)}`;
+      }
+    }
     throw new ApiError(res.status, msg);
   }
   return res.json() as Promise<T>;

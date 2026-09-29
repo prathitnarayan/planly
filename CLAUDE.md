@@ -110,6 +110,8 @@ docs/normalized_schema_future.sql  NOT applied — future row-per-milestone desi
   RLS stays on as the second lock. Never put the service_role key in the backend.
 - Repos return copies; changes persist only via save()/add_checkins() — so in-memory
   behaves like the DB. Check-ins are append-only and only change via add_checkins().
+- A Supabase token stays valid (up to 1h) after its user is DELETED. Writes then hit the goals.user_id
+  foreign key: the API turns that into 401 {code: account_gone} and the frontend signs out (29 Sep incident).
 - No SUPABASE_URL = dev mode (in-memory, one dev user). DATABASE_URL without SUPABASE_URL
   is refused at startup (a real DB with no login).
 - Tests: conftest forces in-memory + dev auth even if .env has real values. Postgres tests
@@ -190,6 +192,7 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
 - Plan page: Today card (ring + checkboxes) → verdict (need/have/finish + load bar) → milestone timeline
   (bar = worked on, tall tick = due, hatched = late) → week strip (days under their weekday) → later weeks.
 - Pages only call the API (lib/api.ts adds the Supabase token). No planning logic in the frontend.
+- Destructive actions are two-step (DeleteGoal: "Delete" -> "Yes, delete"); deleting a goal cascades its check-ins.
 - tests/fake_ai_server.py runs the real API with a scripted AI, for UI work without an AI key.
 
 ## Out of scope for v0

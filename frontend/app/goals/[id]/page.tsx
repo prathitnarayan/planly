@@ -1,10 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { Confirm } from "@/components/goal/Confirm";
 import { Courses } from "@/components/goal/Courses";
+import { DeleteGoal } from "@/components/goal/DeleteGoal";
 import { Estimates } from "@/components/goal/Estimates";
 import { FreeTime } from "@/components/goal/FreeTime";
 import { Interview } from "@/components/goal/Interview";
@@ -18,6 +19,7 @@ const STEPS = ["Questions", "Check", "Hours", "Free time", "Plan"];
 
 export default function GoalPage() {
   const { id } = useParams<{ id: string }>();
+  const router = useRouter();
   const [goal, setGoal] = useState<GoalView | null>(null);
   const [edit, setEdit] = useState<Edit>(null);
   const [reviewing, setReviewing] = useState(false);   // hours step shown until "Next"
@@ -62,6 +64,11 @@ export default function GoalPage() {
           <Courses goalId={id} onChanged={reload} />
         </>
       )}
+      <Rule />
+      <div className="flex items-center justify-between gap-4">
+        <p className="text-xs text-muted">Done with this goal, or started it by mistake?</p>
+        <DeleteGoal goalId={id} title={goal.goal} onDeleted={() => router.replace("/")} />
+      </div>
       <ErrorNote error={error} />
     </>
   );

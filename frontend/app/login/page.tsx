@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button, ErrorNote, Input, Label, PageTitle } from "@/components/ui";
 import { supabase } from "@/lib/supabase";
 
@@ -13,6 +13,12 @@ export default function Login() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
+
+  // sent here after a 401 (e.g. the account was deleted): say why
+  useEffect(() => {
+    const reason = new URLSearchParams(window.location.search).get("reason");
+    if (reason) setError(reason);
+  }, []);
 
   if (!supabase) {
     return <PageTitle sub="Login is off because Supabase isn't configured (local dev mode).">No login needed</PageTitle>;
