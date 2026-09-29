@@ -48,15 +48,17 @@ from app.planners.load import (
     SourceLoad, blueprint_brief, course_key_dates, coverage_warning, source_load,
 )
 from app.planners.feasibility import FeasibilityResult, check_feasibility, resolve_items
+from app.planners.integrity import IntegrityEvent, WatchEvidence, auto_done, coverage, now
 from app.planners.progress import (
-    CheckIn, DueSession, ReplanResult, TodaySession, close_days, day_plan, due_sessions, replan,
+    CheckIn, DayContext, DueSession, ReplanResult, TodaySession, close_days, day_plan, due_sessions, replan,
 )
+from app.planners.tasks import video_key
 from app.planners.scheduler import Schedule, build_schedule
 from app.schemas.blueprint import GoalBlueprint
 from app.schemas.interview import GoalCheck, GoalProfile
 from app.schemas.source import CourseSource, SourceItem, parse_duration
 
-app = FastAPI(title="Planly API", version="0.7.0")
+app = FastAPI(title="Planly API", version="0.8.0")
 
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
@@ -426,7 +428,7 @@ def _replan(rec: GoalRecord, checkins: list[CheckIn], today: date) -> ReplanResu
     p = rec.interview.profile
     try:
         items = resolve_items(bp, p.key_date_map(), p.deadline, 1.0, p.soft_key_dates(), p.deadline_hard)
-        return replan(bp, items, checkins, rec.capacity, today)
+        return replan(bp, items, checkins, rec.capacity, today, penalties=rec.integrity.penalty_minutes)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -502,9 +504,17 @@ def _user_today(today: date | None) -> date:
     return today or server_today()
 
 
+def _day_ctx(ctx: "Ctx", rec: GoalRecord) -> DayContext:
+    """Courses + standing + the watch evidence for this goal's videos."""
+    keys = [k for src in rec.sources for it in src.items if (k := video_key(it.url, it.kind))]
+    evidence = ctx.repo.get_watch(ctx.user_id, keys) if keys else {}
+    return DayContext(sources=rec.sources, integrity=rec.integrity, evidence=evidence)
+
+
 def _close_past_days(ctx: "Ctx", rec: GoalRecord, today: date) -> None:
-    """Every day before today that isn't closed yet: ticks -> check-ins (unticked = missed).
-    The replan then spreads what's left over the coming days at normal daily capacity."""
+    """Every day before today that isn't closed yet: ticks are checked against the evidence and
+    turned into check-ins (unticked = missed, disproved = no credit + time owed). The replan then
+    spreads what's left over the coming days at normal daily capacity."""
     if not (rec.blueprint and rec.capacity and rec.plan_start):
         return
     first = rec.checked_through + timedelta(days=1) if rec.checked_through else rec.plan_start
@@ -512,17 +522,30 @@ def _close_past_days(ctx: "Ctx", rec: GoalRecord, today: date) -> None:
     if first > last:
         return
     try:
-        new, notes = close_days(rec.blueprint, _items(rec), rec.checkins, rec.capacity,
-                                rec.ticks.days, first, last)
+        new, notes, integrity = close_days(rec.blueprint, _items(rec), rec.checkins, rec.capacity,
+                                           rec.ticks.days, first, last, _day_ctx(ctx, rec), rec.ticks.at)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     if new:
         ctx.repo.add_checkins(ctx.user_id, rec.id, new)
         rec.checkins += new
+    rec.integrity = integrity
     rec.checked_through = last
+    keep = lambda sid: sid[:10] > last.isoformat()   # ids start with the ISO day
     rec.ticks.days = {d: ids for d, ids in rec.ticks.days.items() if d > last.isoformat()}
+    rec.ticks.at = {k: v for k, v in rec.ticks.at.items() if keep(k)}
+    rec.ticks.auto = [k for k in rec.ticks.auto if keep(k)]
     rec.ticks.notes, rec.ticks.notes_day = notes, today
     ctx.save(rec)
+
+
+class Standing(BaseModel):
+    trust: int
+    streak: int
+    evidence_only: bool
+    lock_reason: str | None
+    owed_minutes: int                     # extra time added by penalties, still in the plan
+    last_day: list[IntegrityEvent]        # verdicts of the most recently closed day
 
 
 class TodayView(BaseModel):
@@ -530,37 +553,50 @@ class TodayView(BaseModel):
     sessions: list[TodaySession]
     planned_minutes: int
     done_minutes: int
-    moved: list[str]              # unfinished work from earlier days that was re-spread
+    moved: list[str]              # unfinished / disproved work from earlier days
     closed: bool = False          # today was already checked in on the check-in page
     message: str | None = None
     next_day: date | None = None                               # when today has nothing: the next day that does
     next_sessions: list[TodaySession] = Field(default_factory=list)   # preview only, not tickable yet
     can_start_today: bool = False                              # plan starts later and nothing is logged yet
+    watched: dict[str, float] = Field(default_factory=dict)    # video key -> share of the planned part played
+    standing: Standing | None = None
 
 
-def _next_planned(rec: GoalRecord, after: date) -> tuple[date | None, list[TodaySession]]:
+def _standing(rec: GoalRecord, today: date) -> Standing:
+    it = rec.integrity
+    last = max((e.day for e in it.events), default=None)
+    return Standing(trust=it.trust, streak=it.streak, evidence_only=it.evidence_only(today),
+                    lock_reason=it.why_locked(today), owed_minutes=sum(it.penalty_minutes.values()),
+                    last_day=[e for e in it.events if e.day == last] if last else [])
+
+
+def _next_planned(rec: GoalRecord, after: date, dctx: DayContext) -> tuple[date | None, list[TodaySession]]:
     """First day after `after` with sessions, as the plan stands now (preview)."""
     start = max(after + timedelta(days=1), rec.plan_start or after)
-    plan = replan(rec.blueprint, _items(rec), rec.checkins, rec.capacity, today=start)
+    plan = replan(rec.blueprint, _items(rec), rec.checkins, rec.capacity, today=start,
+                  penalties=rec.integrity.penalty_minutes)
     for sprint in plan.schedule.sprints:
         for d in sprint.days:
             if d.sessions:
-                sessions, _ = day_plan(rec.blueprint, _items(rec), rec.checkins, rec.capacity, d.day)
+                sessions, _ = day_plan(rec.blueprint, _items(rec), rec.checkins, rec.capacity, d.day, dctx)
                 return d.day, sessions
     return None, []
 
 
-def _today_view(rec: GoalRecord, today: date) -> TodayView:
-    view = _today_view_inner(rec, today)
+def _today_view(ctx: "Ctx", rec: GoalRecord, today: date, save_auto: bool = True) -> TodayView:
+    dctx = _day_ctx(ctx, rec)
+    view = _today_view_inner(ctx, rec, today, dctx, save_auto)
     if not view.sessions and not view.closed:
         try:
-            view.next_day, view.next_sessions = _next_planned(rec, today)
+            view.next_day, view.next_sessions = _next_planned(rec, today, dctx)
         except ValueError:
             pass
+    view.standing = _standing(rec, today)
     return view
 
 
-def _today_view_inner(rec: GoalRecord, today: date) -> TodayView:
+def _today_view_inner(ctx: "Ctx", rec: GoalRecord, today: date, dctx: DayContext, save_auto: bool) -> TodayView:
     moved = rec.ticks.notes if rec.ticks.notes_day == today else []
     if rec.plan_start and today < rec.plan_start:
         return TodayView(day=today, sessions=[], planned_minutes=0, done_minutes=0, moved=moved,
@@ -570,14 +606,34 @@ def _today_view_inner(rec: GoalRecord, today: date) -> TodayView:
         return TodayView(day=today, sessions=[], planned_minutes=0, done_minutes=0, moved=moved, closed=True,
                          message="Today is already checked in.")
     try:
-        sessions, _ = day_plan(rec.blueprint, _items(rec), rec.checkins, rec.capacity, today)
+        sessions, _ = day_plan(rec.blueprint, _items(rec), rec.checkins, rec.capacity, today, dctx)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
-    ticked = set(rec.ticks.days.get(today.isoformat(), []))
+    key = today.isoformat()
+    ticked = set(rec.ticks.days.get(key, []))
+    sites = dctx.sites()
+    evidence_only = rec.integrity.evidence_only(today)
+    changed = False
     for s in sessions:
+        # the evidence ticks a session by itself once every item is proven (e.g. >= 80% watched)
+        if s.id not in ticked and auto_done(s.items, dctx.evidence, sites, s.minutes):
+            ticked.add(s.id)
+            rec.ticks.auto.append(s.id)
+            rec.ticks.at[s.id] = now()
+            changed = True
         s.done = s.id in ticked
+        s.auto = s.id in rec.ticks.auto
+        s.locked = evidence_only and s.checkable and not s.done
+    if changed and save_auto:
+        rec.ticks.days[key] = sorted(ticked)
+        ctx.save(rec)
+    watched = {}
+    for s in sessions:
+        for it in s.items:
+            if it.video_key and it.video_key in dctx.evidence:
+                watched[it.video_key] = round(coverage(dctx.evidence[it.video_key], it.part_from, it.part_to), 2)
     return TodayView(day=today, sessions=sessions, planned_minutes=sum(s.minutes for s in sessions),
-                     done_minutes=sum(s.minutes for s in sessions if s.done), moved=moved,
+                     done_minutes=sum(s.minutes for s in sessions if s.done), moved=moved, watched=watched,
                      message=None if sessions else "Nothing planned today.")
 
 
@@ -589,7 +645,7 @@ def get_today(goal_id: str, today: date | None = None, ctx: Ctx = Depends()) -> 
     require_blueprint(rec)
     today = _user_today(today)
     _close_past_days(ctx, rec, today)
-    return _today_view(rec, today)
+    return _today_view(ctx, rec, today)
 
 
 class StartToday(BaseModel):
@@ -608,7 +664,7 @@ def start_today(goal_id: str, body: StartToday, ctx: Ctx = Depends()) -> TodayVi
         raise HTTPException(status_code=409, detail="the plan has already started")
     rec.plan_start = today
     ctx.save(rec)
-    return _today_view(rec, today)
+    return _today_view(ctx, rec, today)
 
 
 class Tick(BaseModel):
@@ -619,7 +675,8 @@ class Tick(BaseModel):
 
 @app.put("/goals/{goal_id}/ticks", response_model=TodayView)
 def set_tick(goal_id: str, body: Tick, ctx: Ctx = Depends()) -> TodayView:
-    """Tick / untick one of today's sessions. Nothing is logged until the day is over."""
+    """Tick / untick one of today's sessions. Checked against the evidence when the day closes.
+    While in evidence-only mode, checkable sessions can't be ticked by hand."""
     rec = ctx.load(goal_id)
     today = _user_today(body.day)
     _close_past_days(ctx, rec, today)
@@ -627,11 +684,65 @@ def set_tick(goal_id: str, body: Tick, ctx: Ctx = Depends()) -> TodayView:
         raise HTTPException(status_code=409, detail="that day is already closed")
     if not body.session_id.startswith(body.day.isoformat() + "|"):
         raise HTTPException(status_code=422, detail="session doesn't belong to that day")
+    view = _today_view(ctx, rec, today)
+    session = next((s for s in view.sessions if s.id == body.session_id), None)
+    if session is None:
+        raise HTTPException(status_code=404, detail="no such session today (the plan changed? reload)")
+    if body.done and session.locked:
+        raise HTTPException(status_code=423, detail=(rec.integrity.why_locked(today) or "Evidence only.")
+                            + " Watch / solve it and it ticks itself.")
     ids = set(rec.ticks.days.get(body.day.isoformat(), []))
-    (ids.add if body.done else ids.discard)(body.session_id)
+    if body.done:
+        ids.add(body.session_id)
+        rec.ticks.at[body.session_id] = now()
+    else:
+        ids.discard(body.session_id)
+        rec.ticks.at.pop(body.session_id, None)
+        rec.ticks.auto = [k for k in rec.ticks.auto if k != body.session_id]
     rec.ticks.days[body.day.isoformat()] = sorted(ids)
     ctx.save(rec)
-    return _today_view(rec, today)
+    return _today_view(ctx, rec, today, save_auto=False)
+
+
+# ---------- evidence from the Chrome extension ----------
+
+class WatchEvent(BaseModel):
+    key: str = Field(pattern=r"^(yt:[A-Za-z0-9_-]{11}|page:.{1,500})$")
+    url: str | None = Field(default=None, max_length=2000)
+    title: str | None = Field(default=None, max_length=300)
+    duration_s: float = Field(gt=0, le=24 * 3600)
+    intervals: list[tuple[float, float]] = Field(max_length=500)
+
+
+class WatchBatch(BaseModel):
+    events: list[WatchEvent] = Field(max_length=50)
+
+
+@app.post("/evidence/watch")
+def post_watch(body: WatchBatch, user_id: str = Depends(current_user), repo: GoalRepo = Depends(get_repo)) -> dict:
+    """Played ranges of videos on sites the user switched on. Only ever adds (union)."""
+    merged = repo.merge_watch(user_id, [WatchEvidence(**e.model_dump()) for e in body.events])
+    return {"coverage": {k: round(coverage(v), 3) for k, v in merged.items()}}
+
+
+class GoalToday(BaseModel):
+    goal_id: str
+    goal: str
+    today: TodayView
+
+
+@app.get("/today", response_model=list[GoalToday])
+def all_today(today: date | None = None, ctx: Ctx = Depends()) -> list[GoalToday]:
+    """Today's sessions for every goal (the extension's on-page bar matches videos against these)."""
+    today = _user_today(today)
+    out = []
+    for g in ctx.repo.list(ctx.user_id):
+        rec = ctx.repo.get(ctx.user_id, g.id)
+        if not (rec and rec.blueprint and rec.capacity and rec.plan_start):
+            continue
+        _close_past_days(ctx, rec, today)
+        out.append(GoalToday(goal_id=rec.id, goal=rec.title, today=_today_view(ctx, rec, today)))
+    return out
 
 
 @app.get("/goals/{goal_id}/replan", response_model=ReplanResult)

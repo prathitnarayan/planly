@@ -28,6 +28,18 @@ deadlines, ticks). It never submits, buys or downloads anything.
 
 The courses then show on the goal page in Planly, under **Your courses**.
 
+## Verification (watch time)
+On sites you switched **On**, Planly records which parts of each video actually play: only while
+the tab is visible, not ads, not above 2x, and skipped parts don't count. A small Planly bar
+(bottom right) always shows when it's recording, which of today's tasks the video belongs to,
+how much you've watched, and a checkbox. At 80% watched the task ticks itself.
+
+Lectures embedded from YouTube (IITM) need **youtube.com switched On too**.
+
+Every tick is checked when the day ends. Proof you didn't do it (you opened the video but under
+half played / the site still shows the problem unsolved) = no credit, +25% time owed, trust −15.
+No evidence at all (watched on your phone) = self-reported, never punished.
+
 Switch a site **Off** any time: Chrome removes the access and Planly forgets its pages.
 
 ## Updating the extension

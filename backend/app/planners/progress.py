@@ -24,13 +24,18 @@ least 2 of them before it's trusted, and is clamped to 0.5-2.0.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
 from app.planners.capacity import CapacityProfile
 from app.planners.feasibility import FeasibilityResult, PlanItem, check_items
+from app.planners.integrity import (
+    Integrity, SiteState, WatchEvidence, apply_day, check_session, checkable,
+)
+from app.planners.tasks import SessionItem, attach_items, item_key
+from app.schemas.source import CourseSource
 from app.planners.scheduler import Schedule, build_schedule
 from app.schemas.blueprint import GoalBlueprint
 
@@ -119,7 +124,8 @@ def personal_multiplier(progress: list[MilestoneProgress]) -> float | None:
 
 
 def remaining_items(
-    items: list[PlanItem], progress: list[MilestoneProgress], multiplier: float = 1.0
+    items: list[PlanItem], progress: list[MilestoneProgress], multiplier: float = 1.0,
+    penalties: dict[str, int] | None = None,
 ) -> list[PlanItem]:
     """
     What's left, as plan items. Complete milestones drop out, and dependencies on
@@ -133,7 +139,8 @@ def remaining_items(
         if p.complete or p.remaining_minutes <= 0:
             continue
         factor = multiplier if p.remaining_source == "estimate" else 1.0
-        minutes = p.remaining_minutes * factor
+        # + time owed for work that was ticked but disproved by the evidence (integrity.py)
+        minutes = p.remaining_minutes * factor + (penalties or {}).get(it.key, 0)
         done = max(0.0, min(p.estimate_minutes, p.estimate_minutes - p.remaining_minutes))
         left.append(it.model_copy(update={"minutes": minutes, "done_minutes": done}))
     alive = {it.key for it in left}
@@ -156,10 +163,11 @@ def replan(
     capacity: CapacityProfile,
     today: date,
     use_multiplier: bool = True,
+    penalties: dict[str, int] | None = None,
 ) -> ReplanResult:
     progress = summarize(items, checkins)
     multiplier = personal_multiplier(progress)
-    left = remaining_items(items, progress, multiplier if (use_multiplier and multiplier) else 1.0)
+    left = remaining_items(items, progress, multiplier if (use_multiplier and multiplier) else 1.0, penalties)
     verdict = check_items(left, capacity, today)
     schedule = build_schedule(blueprint, left, capacity, today)
 
@@ -223,10 +231,10 @@ def due_sessions(
 # ---------- daily ticks: the checkbox flow ----------
 #
 # During the day the user ticks sessions. Ticks never change today's list (it stays stable).
-# When a day is over it is CLOSED: each milestone on that day becomes one check-in
-# (all ticked = done, some = partial, none = missed). The next day's plan is then the
-# normal replan: unfinished work flows into the following days at the usual daily
-# capacity, never piled onto one day (the simulation fills each day only up to capacity).
+# When a day is over it is CLOSED: every ticked session is checked against the evidence
+# (integrity.py), then each milestone on that day becomes one check-in with the minutes that
+# were CREDITED. The next day's plan is the normal replan: unfinished work flows into the
+# following days at the usual daily capacity, never piled onto one day.
 
 MAX_DAYS_TO_CLOSE = 60
 
@@ -242,6 +250,25 @@ class TodaySession(BaseModel):
     deliverable: str | None
     kind: str
     done: bool = False
+    items: list[SessionItem] = Field(default_factory=list)   # the lectures / problems it covers
+    checkable: bool = False      # has items the evidence can confirm
+    auto: bool = False           # ticked by the evidence, not by hand
+    locked: bool = False         # evidence-only: can't be ticked by hand right now
+
+
+class DayContext(BaseModel):
+    """Everything besides check-ins that shapes a day's plan and its verification."""
+    model_config = {"arbitrary_types_allowed": True}
+    sources: list[CourseSource] = Field(default_factory=list)
+    integrity: Integrity = Field(default_factory=Integrity)
+    evidence: dict[str, WatchEvidence] = Field(default_factory=dict)
+
+    def sites(self) -> dict[str, SiteState]:
+        out = {}
+        for src in self.sources:
+            for i, it in enumerate(src.items):
+                out[item_key(src, i)] = SiteState(done=it.done, synced_at=src.synced_at)
+        return out
 
 
 def _kind(s) -> str:
@@ -252,10 +279,12 @@ def session_id(day: date, s, index: int) -> str:
     return f"{day.isoformat()}|{s.milestone_key}|{_kind(s)}|{index}"
 
 
-def day_plan(blueprint, items, checkins, capacity, day: date) -> tuple[list[TodaySession], set[str]]:
+def day_plan(blueprint, items, checkins, capacity, day: date,
+             ctx: DayContext | None = None) -> tuple[list[TodaySession], set[str]]:
     """The sessions planned for `day`, given everything logged before it, plus the milestones
     that still have sessions AFTER that day (to know which ones would finish on `day`)."""
-    plan = replan(blueprint, items, checkins, capacity, today=day)
+    ctx = ctx or DayContext()
+    plan = replan(blueprint, items, checkins, capacity, today=day, penalties=ctx.integrity.penalty_minutes)
     sessions, later = [], set()
     for sprint in plan.schedule.sprints:
         for d in sprint.days:
@@ -270,35 +299,58 @@ def day_plan(blueprint, items, checkins, capacity, day: date) -> tuple[list[Toda
                 ]
             elif d.day > day:
                 later |= {s.milestone_key for s in d.sessions}
+    if ctx.sources and sessions:
+        for s, its in zip(sessions, attach_items(sessions, ctx.sources, set(ctx.integrity.items_done),
+                                              ctx.integrity.items_part)):
+            s.items = its
+            s.checkable = checkable(its)
     return sessions, later
 
 
 def close_days(
     blueprint, items, checkins: list[CheckIn], capacity, ticks: dict[str, list[str]],
-    first: date, last: date,
-) -> tuple[list[CheckIn], list[str]]:
-    """Turn ticks on days first..last (inclusive) into check-ins, one day at a time, so each
-    day is judged against the plan the user actually saw that morning.
-    Returns (new check-ins, plain-language notes about work that moved)."""
+    first: date, last: date, ctx: DayContext | None = None,
+    ticked_at: dict[str, datetime] | None = None,
+) -> tuple[list[CheckIn], list[str], Integrity]:
+    """Turn ticks on days first..last (inclusive) into VERIFIED check-ins, one day at a time,
+    so each day is judged against the plan the user actually saw that morning.
+    Returns (new check-ins, plain-language notes, updated integrity)."""
+    ctx = (ctx or DayContext()).model_copy()
+    sites = ctx.sites()
     new: list[CheckIn] = []
     notes: list[str] = []
     day = max(first, last - timedelta(days=MAX_DAYS_TO_CLOSE - 1))
     while day <= last:
-        sessions, later = day_plan(blueprint, items, checkins + new, capacity, day)
+        sessions, later = day_plan(blueprint, items, checkins + new, capacity, day, ctx)
         ticked = set(ticks.get(day.isoformat(), []))
+        results = []
+        credit: dict[str, int] = {}
+        for s in sessions:
+            if s.id not in ticked:
+                continue
+            chk = check_session(s.minutes, s.items, ctx.evidence, sites,
+                                (ticked_at or {}).get(s.id), ctx.integrity.trust)
+            credit[s.id] = chk.credit_minutes
+            results.append((s.milestone_key, s.milestone_name, chk, s.items))
+            if chk.verdict in ("mismatch", "partial"):   # (the verdict itself is shown from integrity events)
+                notes.append(f"{day:%a %d %b}: {s.minutes - chk.credit_minutes} min of {s.milestone_name} "
+                             "didn't count — back in the plan.")
         by_ms: dict[str, list[TodaySession]] = {}
         for s in sessions:
             by_ms.setdefault(s.milestone_key, []).append(s)
         for key, ss in by_ms.items():
             planned = sum(s.minutes for s in ss)
-            did = sum(s.minutes for s in ss if s.id in ticked)
-            outcome = "done" if did == planned else "partial" if did else "missed"
-            # Ticked the last planned piece of a milestone = it's finished.
+            did = sum(credit.get(s.id, 0) for s in ss)
+            outcome = "done" if did >= planned else "partial" if did else "missed"
+            # Credited the whole last planned piece of a milestone = it's finished.
             complete = outcome == "done" and key not in later
             new.append(CheckIn(day=day, milestone_key=key, outcome=outcome, planned_minutes=planned,
-                               actual_minutes=did, milestone_complete=complete, note="ticks"))
-            if did < planned:
-                notes.append(f"{day:%a %d %b}: {planned - did} min of {ss[0].milestone_name} not done "
+                               actual_minutes=min(did, planned) if did else 0,
+                               milestone_complete=complete, note="ticks"))
+            unticked = sum(s.minutes for s in ss if s.id not in ticked)
+            if unticked:
+                notes.append(f"{day:%a %d %b}: {unticked} min of {ss[0].milestone_name} not done "
                              "— spread over the next days.")
+        ctx.integrity = apply_day(ctx.integrity, day, results, anything_planned=bool(sessions))
         day += timedelta(days=1)
-    return new, notes
+    return new, notes, ctx.integrity

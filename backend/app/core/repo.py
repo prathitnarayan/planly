@@ -25,12 +25,15 @@ from app.ai.goal_intake import InterviewState
 from app.planners.capacity import CapacityProfile
 from app.planners.progress import CheckIn
 from app.schemas.blueprint import GoalBlueprint
+from app.planners.integrity import Integrity, WatchEvidence, merge_intervals
 from app.schemas.source import CourseSource
 
 
 class Ticks(BaseModel):
     """Checkbox state for days that aren't closed yet, plus notes from the last close."""
     days: dict[str, list[str]] = Field(default_factory=dict)   # "2026-09-29" -> ticked session ids
+    at: dict[str, datetime] = Field(default_factory=dict)      # session id -> when it was ticked
+    auto: list[str] = Field(default_factory=list)              # session ids ticked by the evidence
     notes: list[str] = Field(default_factory=list)             # "Tue 29 Sep: 45 min of X not done..."
     notes_day: date | None = None                              # the day those notes are for
 
@@ -45,6 +48,7 @@ class GoalRecord(BaseModel):
     checked_through: date | None = None   # last day the user has checked in for
     sources: list[CourseSource] = Field(default_factory=list)   # synced course pages (003)
     ticks: "Ticks" = Field(default_factory=lambda: Ticks())      # today's checkboxes (004)
+    integrity: Integrity = Field(default_factory=Integrity)     # trust, streak, penalties (005)
 
     @property
     def title(self) -> str:
@@ -69,6 +73,17 @@ class GoalRepo(Protocol):
     def add_checkins(self, user_id: str, goal_id: str, checkins: list[CheckIn]) -> None: ...
     def log_correction(self, user_id: str, goal_id: str | None, row: dict) -> None: ...
     def delete(self, user_id: str, goal_id: str) -> bool: ...
+    def merge_watch(self, user_id: str, events: list[WatchEvidence]) -> dict[str, WatchEvidence]: ...
+    def get_watch(self, user_id: str, keys: list[str]) -> dict[str, WatchEvidence]: ...
+
+
+def _merged(old: WatchEvidence | None, ev: WatchEvidence) -> WatchEvidence:
+    """Watch evidence only ever grows: played ranges are unioned, never replaced."""
+    duration = max(ev.duration_s, old.duration_s if old else 0)
+    ranges = (old.intervals if old else []) + ev.intervals
+    return WatchEvidence(key=ev.key, url=ev.url or (old.url if old else None),
+                         title=ev.title or (old.title if old else None), duration_s=duration,
+                         intervals=merge_intervals(ranges, duration), updated_at=datetime.now(timezone.utc))
 
 
 def _valid_uuid(value: str) -> bool:
@@ -86,6 +101,16 @@ class InMemoryRepo:
         self._goals: dict[tuple[str, str], GoalRecord] = {}
         self._updated: dict[tuple[str, str], datetime] = {}
         self.corrections: list[dict] = []
+        self.watch: dict[tuple[str, str], WatchEvidence] = {}
+
+    def merge_watch(self, user_id, events):
+        out = {}
+        for ev in events:
+            out[ev.key] = self.watch[(user_id, ev.key)] = _merged(self.watch.get((user_id, ev.key)), ev)
+        return {k: v.model_copy(deep=True) for k, v in out.items()}
+
+    def get_watch(self, user_id, keys):
+        return {k: self.watch[(user_id, k)].model_copy(deep=True) for k in keys if (user_id, k) in self.watch}
 
     def create(self, user_id, interview):
         rec = GoalRecord(id=str(uuid.uuid4()), interview=interview)
@@ -193,7 +218,7 @@ class PostgresRepo:
             return None
         with self.pool.connection() as conn:
             row = conn.execute(
-                """select interview, blueprint, capacity, plan_start, checked_through, sources, ticks
+                """select interview, blueprint, capacity, plan_start, checked_through, sources, ticks, integrity
                    from public.goals where id = %s and user_id = %s""",
                 (goal_id, user_id),
             ).fetchone()
@@ -215,6 +240,7 @@ class PostgresRepo:
             checked_through=row[4],
             sources=[CourseSource.model_validate(x) for x in (row[5] or [])],
             ticks=Ticks.model_validate(row[6] or {}),
+            integrity=Integrity.model_validate(row[7] or {}),
             checkins=[
                 CheckIn(day=c[0], milestone_key=c[1], outcome=c[2], planned_minutes=c[3],
                         actual_minutes=c[4], milestone_complete=c[5], remaining_minutes=c[6], note=c[7])
@@ -242,11 +268,12 @@ class PostgresRepo:
         with self.pool.connection() as conn:
             cur = conn.execute(
                 """update public.goals set title = %s, interview = %s, blueprint = %s, capacity = %s,
-                          plan_start = %s, checked_through = %s, sources = %s, ticks = %s
+                          plan_start = %s, checked_through = %s, sources = %s, ticks = %s, integrity = %s
                    where id = %s and user_id = %s""",
                 (rec.title, self._json(rec.interview), self._json(rec.blueprint),
                  self._json(rec.capacity), rec.plan_start, rec.checked_through,
-                 self._jsonlist(rec.sources), self._json(rec.ticks), rec.id, user_id),
+                 self._jsonlist(rec.sources), self._json(rec.ticks), self._json(rec.integrity),
+                 rec.id, user_id),
             )
             if cur.rowcount != 1:
                 raise KeyError(rec.id)
@@ -287,6 +314,35 @@ class PostgresRepo:
         with self.pool.connection() as conn:
             cur = conn.execute("delete from public.goals where id = %s and user_id = %s", (goal_id, user_id))
             return cur.rowcount == 1
+
+    def get_watch(self, user_id, keys):
+        if not keys:
+            return {}
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """select video_key, url, title, duration_s, intervals, updated_at
+                   from public.watch_evidence where user_id = %s and video_key = any(%s)""",
+                (user_id, list(keys)),
+            ).fetchall()
+        return {r[0]: WatchEvidence(key=r[0], url=r[1], title=r[2], duration_s=r[3],
+                                    intervals=[tuple(x) for x in (r[4] or [])], updated_at=r[5]) for r in rows}
+
+    def merge_watch(self, user_id, events):
+        from psycopg.types.json import Jsonb
+        old = self.get_watch(user_id, [e.key for e in events])
+        out = {}
+        with self.pool.connection() as conn:
+            for ev in events:
+                m = _merged(old.get(ev.key), ev)
+                old[ev.key] = out[ev.key] = m
+                conn.execute(
+                    """insert into public.watch_evidence (user_id, video_key, url, title, duration_s, intervals, updated_at)
+                       values (%s, %s, %s, %s, %s, %s, now())
+                       on conflict (user_id, video_key) do update set url = excluded.url, title = excluded.title,
+                         duration_s = excluded.duration_s, intervals = excluded.intervals, updated_at = now()""",
+                    (user_id, m.key, m.url, m.title, m.duration_s, Jsonb([list(x) for x in m.intervals])),
+                )
+        return out
 
     def close(self) -> None:
         self.pool.close()

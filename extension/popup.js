@@ -81,7 +81,7 @@ async function renderSite() {
   t.textContent = on ? "On" : "Off";
   t.setAttribute("aria-pressed", String(on));
   $("toggle-help").textContent = on
-    ? "Planly can read pages on this site, only when you sync (or re-open a page you synced)."
+    ? "On: Planly reads pages you sync here and records which parts of videos play (for verification). Lectures embedded from YouTube need YouTube switched on too."
     : "Planly can't see this site. Switch on to let it read the pages you sync here.";
   show("on", on);
   if (on) await loadGoals();
@@ -97,7 +97,9 @@ $("toggle").onclick = async () => {
   } else {
     const granted = await chrome.permissions.request({ origins: [origin] });
     if (!granted) error("Chrome didn't allow it, so Planly still can't see this site.");
+    else await chrome.runtime.sendMessage({ type: "site-on", tabId: tab.id });   // start tracking this tab now
   }
+  await chrome.runtime.sendMessage({ type: "site-on" });                          // (un)register the tracker
   renderSite();
 };
 

@@ -51,7 +51,88 @@ async function syncTab(tabId, url, goalId, goalTitle, auto) {
   }
 }
 
+// ---------- watch evidence + the on-page bar ----------
+
+const CONTENT_ID = (origin) => "planly-watch-" + origin.replace(/[^a-z0-9]/gi, "_");
+const STATIC_HOSTS = new Set(chrome.runtime.getManifest().host_permissions);
+
+/** Register the watch tracker for exactly the sites the user switched on. */
+async function syncContentScripts() {
+  const { origins = [] } = await chrome.permissions.getAll();
+  const wanted = origins.filter((o) => !STATIC_HOSTS.has(o));
+  const have = await chrome.scripting.getRegisteredContentScripts();
+  const stale = have.filter((c) => c.id.startsWith("planly-watch-") && !wanted.some((o) => CONTENT_ID(o) === c.id));
+  if (stale.length) await chrome.scripting.unregisterContentScripts({ ids: stale.map((c) => c.id) });
+  const missing = wanted.filter((o) => !have.some((c) => c.id === CONTENT_ID(o)));
+  if (missing.length) {
+    await chrome.scripting.registerContentScripts(missing.map((o) => ({
+      id: CONTENT_ID(o), matches: [o], js: ["content/watch.js"], allFrames: true, runAt: "document_idle",
+    })));
+  }
+}
+chrome.runtime.onInstalled.addListener(() => syncContentScripts().catch(() => {}));
+chrome.runtime.onStartup.addListener(() => syncContentScripts().catch(() => {}));
+chrome.permissions.onAdded.addListener(() => syncContentScripts().catch(() => {}));
+chrome.permissions.onRemoved.addListener(() => syncContentScripts().catch(() => {}));
+
+// Evidence is queued in storage so nothing is lost if Planly is asleep (free Render plan).
+async function sendWatch(events) {
+  const { watchQueue = [] } = await chrome.storage.local.get("watchQueue");
+  const queue = [...watchQueue, ...events].slice(-500);
+  try {
+    for (let i = 0; i < queue.length; i += 50) await api("POST", "/evidence/watch", { events: queue.slice(i, i + 50) });
+    await chrome.storage.local.set({ watchQueue: [] });
+    todayCache = null;
+  } catch {
+    await chrome.storage.local.set({ watchQueue: queue });
+  }
+}
+
+let todayCache = null;   // { at, data }
+const localDay = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
+async function lookup(keys) {
+  if (!todayCache || Date.now() - todayCache.at > 60_000) {
+    todayCache = { at: Date.now(), data: await api("GET", `/today?today=${localDay()}`) };
+  }
+  for (const g of todayCache.data) {
+    for (const s of g.today.sessions) {
+      const item = s.items.find((it) => it.video_key && keys.includes(it.video_key));
+      if (item) {
+        return { goalId: g.goal_id, goal: g.goal, day: g.today.day, session: s, item,
+                 watched: g.today.watched[item.video_key] ?? null };
+      }
+    }
+  }
+  return null;
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+  if (msg.type === "watch") {
+    sendWatch(msg.events).finally(() => reply({ ok: true }));
+    return true;
+  }
+  if (msg.type === "lookup") {
+    lookup(msg.keys || []).then((match) => reply({ match }))
+      .catch((e) => reply({ match: null, error: e.message || String(e) }));
+    return true;
+  }
+  if (msg.type === "tick") {
+    api("PUT", `/goals/${msg.goalId}/ticks`, { day: msg.day, session_id: msg.sessionId, done: msg.done })
+      .then(() => { todayCache = null; reply({ ok: true }); })
+      .catch((e) => reply({ ok: false, error: e.message || String(e) }));
+    return true;
+  }
+  if (msg.type === "site-on") {
+    syncContentScripts()
+      .then(() => msg.tabId && chrome.scripting.executeScript({ target: { tabId: msg.tabId, allFrames: true }, files: ["content/watch.js"] }))
+      .then(() => reply({ ok: true }))
+      .catch((e) => reply({ ok: false, error: e.message || String(e) }));
+    return true;
+  }
   if (msg.type === "sync") {
     syncTab(msg.tabId, msg.url, msg.goalId, msg.goalTitle, msg.auto)
       .then((w) => reply({ ok: true, watched: w }))

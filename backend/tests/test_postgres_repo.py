@@ -286,3 +286,26 @@ def test_checkin_script_on_supabase(dsn, repo, monkeypatch):
     monkeypatch.setattr(builtins, "input", lambda *_: pytest.fail("shouldn't ask anything"))
     ck.main()
     assert len(repo.get(carol, rec.id).checkins) == 2
+
+
+def test_watch_evidence_unions_and_stays_per_user(repo):
+    from app.planners.integrity import WatchEvidence
+    k = "yt:" + "q" * 11
+    repo.merge_watch(ALICE, [WatchEvidence(key=k, duration_s=600, intervals=[(0, 100)])])
+    got = repo.merge_watch(ALICE, [WatchEvidence(key=k, duration_s=600, intervals=[(90, 300), (500, 900)])])
+    assert got[k].intervals == [(0, 300), (500, 600)]                  # union, clipped to the length
+    assert repo.get_watch(ALICE, [k])[k].intervals == [(0, 300), (500, 600)]
+    assert repo.get_watch(BOB, [k]) == {}
+
+
+def test_integrity_and_tick_times_roundtrip(repo):
+    from datetime import datetime, timezone
+
+    from app.planners.integrity import Integrity
+    rec = repo.create(ALICE, interview())
+    rec.integrity = Integrity(trust=70, streak=2, penalty_minutes={"a": 15}, items_part={"x:1": 0.5})
+    rec.ticks.at["2026-10-05|a|learn|0"] = datetime(2026, 10, 5, 12, tzinfo=timezone.utc)
+    repo.save(ALICE, rec)
+    got = repo.get(ALICE, rec.id)
+    assert (got.integrity.trust, got.integrity.penalty_minutes, got.integrity.items_part) == (70, {"a": 15}, {"x:1": 0.5})
+    assert got.ticks.at["2026-10-05|a|learn|0"].year == 2026

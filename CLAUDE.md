@@ -31,7 +31,9 @@ backend/app/
                          splits by kind (learn→practice→project…), places in slots, groups Mon–Sun sprints
   planners/load.py       course items -> study minutes (video x1.5, problems by difficulty); unsized = asked, not guessed
   planners/progress.py   check-ins → progress (remaining + its source) → personal multiplier → replan;
-                         day_plan/close_days: Today checkboxes -> one check-in per milestone per closed day
+                         day_plan/close_days: Today checkboxes -> VERIFIED check-ins, one per milestone per closed day
+  planners/tasks.py      sessions -> concrete lectures/problems (learn→videos, practice→problems), long videos split
+  planners/integrity.py  evidence vs ticks: verified / partial / self / mismatch; trust, streak, owed minutes, locks
   core/plan_file.py      TEMP: one saved plan in data/plan.json for the terminal scripts
   ai/llm.py              LLMClient, OpenAIClient, generate_validated (validate + 1 retry)
   ai/prompts.py          all prompts
@@ -55,7 +57,7 @@ extension/               Chrome MV3: per-site ON via optional_host_permissions (
                          background.js POSTs /sources/page and auto-re-syncs watched pages (<= every 6h)
 frontend/components/goal/Courses.tsx  "Your courses" panel: load per course, items by section, add by link
 backend/tests/           pytest; every planner function gets tests
-database/migrations/     001_planly.sql (+ 002_tracking.sql: plan_start, checked_through; 003_sources.sql: goals.sources). Run in order.
+database/migrations/     001..005, run in order (002 tracking dates, 003 sources, 004 ticks, 005 integrity + watch_evidence).
                          001_planly.sql — goals (JSONB docs) + append-only checkins / estimate_corrections, RLS
 docs/SUPABASE_SETUP.md   step-by-step connection guide
 docs/normalized_schema_future.sql  NOT applied — future row-per-milestone design
@@ -144,7 +146,9 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
 - [x] Chrome extension + add-by-link (YouTube API / public pages) + Courses panel on the goal page
 - [x] Today checkboxes (GET /today, PUT /ticks; 004_ticks.sql). Past days auto-close on /today or /replan:
       ticked = done, some = partial, none = missed; last planned piece ticked = milestone complete.
-- [ ] Manual lecture ticks in the app; Codeforces/LeetCode solved counts via their APIs
+- [x] Verification (API 0.8.0): lecture-level tasks, extension watch tracking + on-page bar, auto-tick at 80%,
+      strict consequences (no credit, +25% owed, trust, streak, evidence-only mode, 3-in-7 lock). 005_integrity.sql
+- [ ] Codeforces/LeetCode solved via their APIs (stronger practice evidence); trust per user instead of per goal
 - Later: web research, PDF parsing, ML duration model, what-if simulation
 
 ## Today / ticks rules
@@ -156,6 +160,15 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
 - Frontend calls /today BEFORE /replan (sequentially) so a day is closed exactly once.
 - A day with nothing to tick (plan starts later / free day) shows "Next up" (preview, hatched boxes) and,
   before the plan starts, "Start today instead" (POST /start-today; only if nothing is logged yet).
+
+## Verification rules
+- A penalty needs PROOF: video opened in tracked Chrome but < 50% of the planned part played, or the site
+  re-read AFTER the tick still shows it not done. No evidence = self-reported, never punished.
+- Watch evidence only grows (union of played ranges), only while the tab is visible, ads and > 2x skipped.
+  Collected only on sites switched On; the on-page bar always shows it's recording.
+- A disproved session credits nothing (not even its unproven items). Auto-tick needs items to fill >= 80%
+  of the session AND every item proven.
+- All thresholds are constants at the top of planners/integrity.py.
 
 ## Course sync rules
 - Logged-in reading happens ONLY in the user's own browser (extension) or laptop (sync tool). The server

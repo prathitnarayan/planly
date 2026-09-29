@@ -182,12 +182,27 @@ export type SyncResult = {
   load: SourceLoad; items: SourceItem[]; key_dates_added: string[]; key_dates_moved: string[]; messages: string[];
 };
 
+export type SessionItem = {
+  key: string; title: string; kind: string; url: string | null; video_key: string | null; minutes: number;
+  part_from: number; part_to: number; length_minutes: number | null; verify: "video" | "site" | "none";
+};
 export type TodaySession = {
   id: string; day: string; start: string | null; end: string | null; minutes: number;
   milestone_key: string; milestone_name: string; deliverable: string | null; kind: string; done: boolean;
+  items: SessionItem[]; checkable: boolean; auto: boolean; locked: boolean;
+};
+export type Verdict = "verified" | "partial" | "self" | "mismatch";
+export type IntegrityEvent = {
+  day: string; session: string; verdict: Verdict; claimed_minutes: number; credit_minutes: number;
+  penalty_minutes: number; trust_after: number; detail: string;
+};
+export type Standing = {
+  trust: number; streak: number; evidence_only: boolean; lock_reason: string | null;
+  owed_minutes: number; last_day: IntegrityEvent[];
 };
 export type TodayView = {
   day: string; sessions: TodaySession[]; planned_minutes: number; done_minutes: number;
   moved: string[]; closed: boolean; message: string | null;
   next_day: string | null; next_sessions: TodaySession[]; can_start_today: boolean;
+  watched: Record<string, number>; standing: Standing | null;
 };
