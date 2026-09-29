@@ -4,8 +4,9 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { ErrorNote, Loading, Status } from "@/components/ui";
 import { api } from "@/lib/api";
-import { day, hours, minutesToHours, pretty, shortName, time } from "@/lib/format";
-import type { Replan, Sprint } from "@/lib/types";
+import { Today } from "@/components/goal/Today";
+import { day, hours, isoToday, minutesToHours, pretty, shortName, time } from "@/lib/format";
+import type { Replan, Sprint, TodayView } from "@/lib/types";
 
 function weekLine(sp: Sprint, deliverableOf: Record<string, string | null>) {
   const groups = new Map<string, string[]>();
@@ -28,10 +29,16 @@ export function Plan({ goalId, hasCheckins, onEditHours, onEditTime }: {
   onEditTime: () => void;
 }) {
   const [r, setR] = useState<Replan | null>(null);
+  const [today, setToday] = useState<TodayView | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    api<Replan>(`/goals/${goalId}/replan`).then(setR).catch((e) => setError(e.message));
+    // /today first: it closes finished days (unticked -> missed), then the plan reflects that.
+    const query = { today: isoToday() };
+    api<TodayView>(`/goals/${goalId}/today`, { query })
+      .then((t) => { setToday(t); return api<Replan>(`/goals/${goalId}/replan`, { query }); })
+      .then(setR)
+      .catch((e) => setError(e.message));
   }, [goalId]);
 
   if (!r) return error ? <ErrorNote error={error} /> : <Loading label="Planning" />;
@@ -44,6 +51,8 @@ export function Plan({ goalId, hasCheckins, onEditHours, onEditTime }: {
 
   return (
     <div>
+      {today && <Today goalId={goalId} view={today} onChange={setToday} />}
+
       {/* verdict */}
       <div className={`mb-8 rounded-lg p-5 ${f.feasible ? "border border-line" : "border-2 border-ink"}`}>
         <p className="text-xl font-semibold">
@@ -180,7 +189,7 @@ export function Plan({ goalId, hasCheckins, onEditHours, onEditTime }: {
           </ul>
         </>
       )}
-      {!hasCheckins && <p className="mt-8 text-sm text-muted">Tip: check in each evening. Missed work goes back into the plan, and it tells you early if a deadline slips.</p>}
+      {!hasCheckins && <p className="mt-8 text-sm text-muted">Tip: tick sessions as you finish them. Unticked work moves to the next days on its own, and the plan tells you early if a deadline slips.</p>}
     </div>
   );
 }

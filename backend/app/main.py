@@ -48,13 +48,15 @@ from app.planners.load import (
     SourceLoad, blueprint_brief, course_key_dates, coverage_warning, source_load,
 )
 from app.planners.feasibility import FeasibilityResult, check_feasibility, resolve_items
-from app.planners.progress import CheckIn, DueSession, ReplanResult, due_sessions, replan
+from app.planners.progress import (
+    CheckIn, DueSession, ReplanResult, TodaySession, close_days, day_plan, due_sessions, replan,
+)
 from app.planners.scheduler import Schedule, build_schedule
 from app.schemas.blueprint import GoalBlueprint
 from app.schemas.interview import GoalCheck, GoalProfile
 from app.schemas.source import CourseSource, SourceItem, parse_duration
 
-app = FastAPI(title="Planly API", version="0.5.0")
+app = FastAPI(title="Planly API", version="0.6.0")
 
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
@@ -482,11 +484,118 @@ def add_checkins(goal_id: str, body: CheckInBatch, ctx: Ctx = Depends()) -> Repl
     return result
 
 
+# ---------- today: checkboxes; unticked work rolls over at the end of the day ----------
+
+def server_today() -> date:
+    return date.today()
+
+
+def _plausible_today(today: date | None) -> bool:
+    """The browser sends the user's local date (the server runs in UTC). Only trust it within
+    a day of the server's date, so a wrong clock can't close future days."""
+    return today is None or abs((today - server_today()).days) <= 1
+
+
+def _user_today(today: date | None) -> date:
+    if not _plausible_today(today):
+        raise HTTPException(status_code=422, detail="today is too far from the server's date")
+    return today or server_today()
+
+
+def _close_past_days(ctx: "Ctx", rec: GoalRecord, today: date) -> None:
+    """Every day before today that isn't closed yet: ticks -> check-ins (unticked = missed).
+    The replan then spreads what's left over the coming days at normal daily capacity."""
+    if not (rec.blueprint and rec.capacity and rec.plan_start):
+        return
+    first = rec.checked_through + timedelta(days=1) if rec.checked_through else rec.plan_start
+    last = today - timedelta(days=1)
+    if first > last:
+        return
+    try:
+        new, notes = close_days(rec.blueprint, _items(rec), rec.checkins, rec.capacity,
+                                rec.ticks.days, first, last)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    if new:
+        ctx.repo.add_checkins(ctx.user_id, rec.id, new)
+        rec.checkins += new
+    rec.checked_through = last
+    rec.ticks.days = {d: ids for d, ids in rec.ticks.days.items() if d > last.isoformat()}
+    rec.ticks.notes, rec.ticks.notes_day = notes, today
+    ctx.save(rec)
+
+
+class TodayView(BaseModel):
+    day: date
+    sessions: list[TodaySession]
+    planned_minutes: int
+    done_minutes: int
+    moved: list[str]              # unfinished work from earlier days that was re-spread
+    closed: bool = False          # today was already checked in on the check-in page
+    message: str | None = None
+
+
+def _today_view(rec: GoalRecord, today: date) -> TodayView:
+    moved = rec.ticks.notes if rec.ticks.notes_day == today else []
+    if rec.plan_start and today < rec.plan_start:
+        return TodayView(day=today, sessions=[], planned_minutes=0, done_minutes=0, moved=moved,
+                         message=f"Your plan starts {rec.plan_start:%a %d %b}.")
+    if rec.checked_through and rec.checked_through >= today:
+        return TodayView(day=today, sessions=[], planned_minutes=0, done_minutes=0, moved=moved, closed=True,
+                         message="Today is already checked in.")
+    try:
+        sessions, _ = day_plan(rec.blueprint, _items(rec), rec.checkins, rec.capacity, today)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    ticked = set(rec.ticks.days.get(today.isoformat(), []))
+    for s in sessions:
+        s.done = s.id in ticked
+    return TodayView(day=today, sessions=sessions, planned_minutes=sum(s.minutes for s in sessions),
+                     done_minutes=sum(s.minutes for s in sessions if s.done), moved=moved,
+                     message=None if sessions else "Nothing planned today.")
+
+
+@app.get("/goals/{goal_id}/today", response_model=TodayView)
+def get_today(goal_id: str, today: date | None = None, ctx: Ctx = Depends()) -> TodayView:
+    rec = ctx.load(goal_id)
+    if not rec.capacity or not rec.plan_start:
+        raise HTTPException(status_code=409, detail="set capacity first: PUT /goals/{id}/capacity")
+    require_blueprint(rec)
+    today = _user_today(today)
+    _close_past_days(ctx, rec, today)
+    return _today_view(rec, today)
+
+
+class Tick(BaseModel):
+    day: date
+    session_id: str = Field(min_length=3, max_length=300)
+    done: bool
+
+
+@app.put("/goals/{goal_id}/ticks", response_model=TodayView)
+def set_tick(goal_id: str, body: Tick, ctx: Ctx = Depends()) -> TodayView:
+    """Tick / untick one of today's sessions. Nothing is logged until the day is over."""
+    rec = ctx.load(goal_id)
+    today = _user_today(body.day)
+    _close_past_days(ctx, rec, today)
+    if rec.checked_through and body.day <= rec.checked_through:
+        raise HTTPException(status_code=409, detail="that day is already closed")
+    if not body.session_id.startswith(body.day.isoformat() + "|"):
+        raise HTTPException(status_code=422, detail="session doesn't belong to that day")
+    ids = set(rec.ticks.days.get(body.day.isoformat(), []))
+    (ids.add if body.done else ids.discard)(body.session_id)
+    rec.ticks.days[body.day.isoformat()] = sorted(ids)
+    ctx.save(rec)
+    return _today_view(rec, today)
+
+
 @app.get("/goals/{goal_id}/replan", response_model=ReplanResult)
 def get_replan(goal_id: str, today: date | None = None, ctx: Ctx = Depends()) -> ReplanResult:
     """The plan from the first day that still needs doing: not before the plan starts,
     and not a day you've already checked in for (that work is already counted)."""
     rec = ctx.load(goal_id)
+    if rec.blueprint and rec.capacity and _plausible_today(today):   # "what if" dates don't close days
+        _close_past_days(ctx, rec, today or server_today())
     start = today or date.today()
     if rec.plan_start and rec.plan_start > start:
         start = rec.plan_start

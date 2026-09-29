@@ -28,6 +28,13 @@ from app.schemas.blueprint import GoalBlueprint
 from app.schemas.source import CourseSource
 
 
+class Ticks(BaseModel):
+    """Checkbox state for days that aren't closed yet, plus notes from the last close."""
+    days: dict[str, list[str]] = Field(default_factory=dict)   # "2026-09-29" -> ticked session ids
+    notes: list[str] = Field(default_factory=list)             # "Tue 29 Sep: 45 min of X not done..."
+    notes_day: date | None = None                              # the day those notes are for
+
+
 class GoalRecord(BaseModel):
     id: str
     interview: InterviewState
@@ -37,6 +44,7 @@ class GoalRecord(BaseModel):
     plan_start: date | None = None        # first planned day (set when capacity is first saved)
     checked_through: date | None = None   # last day the user has checked in for
     sources: list[CourseSource] = Field(default_factory=list)   # synced course pages (003)
+    ticks: "Ticks" = Field(default_factory=lambda: Ticks())      # today's checkboxes (004)
 
     @property
     def title(self) -> str:
@@ -185,7 +193,7 @@ class PostgresRepo:
             return None
         with self.pool.connection() as conn:
             row = conn.execute(
-                """select interview, blueprint, capacity, plan_start, checked_through, sources
+                """select interview, blueprint, capacity, plan_start, checked_through, sources, ticks
                    from public.goals where id = %s and user_id = %s""",
                 (goal_id, user_id),
             ).fetchone()
@@ -206,6 +214,7 @@ class PostgresRepo:
             plan_start=row[3],
             checked_through=row[4],
             sources=[CourseSource.model_validate(x) for x in (row[5] or [])],
+            ticks=Ticks.model_validate(row[6] or {}),
             checkins=[
                 CheckIn(day=c[0], milestone_key=c[1], outcome=c[2], planned_minutes=c[3],
                         actual_minutes=c[4], milestone_complete=c[5], remaining_minutes=c[6], note=c[7])
@@ -233,11 +242,11 @@ class PostgresRepo:
         with self.pool.connection() as conn:
             cur = conn.execute(
                 """update public.goals set title = %s, interview = %s, blueprint = %s, capacity = %s,
-                          plan_start = %s, checked_through = %s, sources = %s
+                          plan_start = %s, checked_through = %s, sources = %s, ticks = %s
                    where id = %s and user_id = %s""",
                 (rec.title, self._json(rec.interview), self._json(rec.blueprint),
                  self._json(rec.capacity), rec.plan_start, rec.checked_through,
-                 self._jsonlist(rec.sources), rec.id, user_id),
+                 self._jsonlist(rec.sources), self._json(rec.ticks), rec.id, user_id),
             )
             if cur.rowcount != 1:
                 raise KeyError(rec.id)

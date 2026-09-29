@@ -181,3 +181,12 @@ export type SourceView = { load: SourceLoad; items: SourceItem[]; synced_at: str
 export type SyncResult = {
   load: SourceLoad; items: SourceItem[]; key_dates_added: string[]; key_dates_moved: string[]; messages: string[];
 };
+
+export type TodaySession = {
+  id: string; day: string; start: string | null; end: string | null; minutes: number;
+  milestone_key: string; milestone_name: string; deliverable: string | null; kind: string; done: boolean;
+};
+export type TodayView = {
+  day: string; sessions: TodaySession[]; planned_minutes: number; done_minutes: number;
+  moved: string[]; closed: boolean; message: string | null;
+};

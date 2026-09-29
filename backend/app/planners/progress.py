@@ -24,7 +24,7 @@ least 2 of them before it's trusted, and is clamped to 0.5-2.0.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -218,3 +218,87 @@ def due_sessions(
         DueSession(day=d, milestone_key=k, milestone_name=names[k], planned_minutes=m)
         for (d, k), m in sorted(totals.items())
     ]
+
+
+# ---------- daily ticks: the checkbox flow ----------
+#
+# During the day the user ticks sessions. Ticks never change today's list (it stays stable).
+# When a day is over it is CLOSED: each milestone on that day becomes one check-in
+# (all ticked = done, some = partial, none = missed). The next day's plan is then the
+# normal replan: unfinished work flows into the following days at the usual daily
+# capacity, never piled onto one day (the simulation fills each day only up to capacity).
+
+MAX_DAYS_TO_CLOSE = 60
+
+
+class TodaySession(BaseModel):
+    id: str
+    day: date
+    start: str | None
+    end: str | None
+    minutes: int
+    milestone_key: str
+    milestone_name: str
+    deliverable: str | None
+    kind: str
+    done: bool = False
+
+
+def _kind(s) -> str:
+    return getattr(s.kind, "value", s.kind)
+
+
+def session_id(day: date, s, index: int) -> str:
+    return f"{day.isoformat()}|{s.milestone_key}|{_kind(s)}|{index}"
+
+
+def day_plan(blueprint, items, checkins, capacity, day: date) -> tuple[list[TodaySession], set[str]]:
+    """The sessions planned for `day`, given everything logged before it, plus the milestones
+    that still have sessions AFTER that day (to know which ones would finish on `day`)."""
+    plan = replan(blueprint, items, checkins, capacity, today=day)
+    sessions, later = [], set()
+    for sprint in plan.schedule.sprints:
+        for d in sprint.days:
+            if d.day == day:
+                sessions = [
+                    TodaySession(id=session_id(day, s, i), day=day,
+                                 start=s.start.strftime("%H:%M") if s.start else None,
+                                 end=s.end.strftime("%H:%M") if s.end else None,
+                                 minutes=s.minutes, milestone_key=s.milestone_key,
+                                 milestone_name=s.milestone_name, deliverable=s.deliverable, kind=_kind(s))
+                    for i, s in enumerate(d.sessions)
+                ]
+            elif d.day > day:
+                later |= {s.milestone_key for s in d.sessions}
+    return sessions, later
+
+
+def close_days(
+    blueprint, items, checkins: list[CheckIn], capacity, ticks: dict[str, list[str]],
+    first: date, last: date,
+) -> tuple[list[CheckIn], list[str]]:
+    """Turn ticks on days first..last (inclusive) into check-ins, one day at a time, so each
+    day is judged against the plan the user actually saw that morning.
+    Returns (new check-ins, plain-language notes about work that moved)."""
+    new: list[CheckIn] = []
+    notes: list[str] = []
+    day = max(first, last - timedelta(days=MAX_DAYS_TO_CLOSE - 1))
+    while day <= last:
+        sessions, later = day_plan(blueprint, items, checkins + new, capacity, day)
+        ticked = set(ticks.get(day.isoformat(), []))
+        by_ms: dict[str, list[TodaySession]] = {}
+        for s in sessions:
+            by_ms.setdefault(s.milestone_key, []).append(s)
+        for key, ss in by_ms.items():
+            planned = sum(s.minutes for s in ss)
+            did = sum(s.minutes for s in ss if s.id in ticked)
+            outcome = "done" if did == planned else "partial" if did else "missed"
+            # Ticked the last planned piece of a milestone = it's finished.
+            complete = outcome == "done" and key not in later
+            new.append(CheckIn(day=day, milestone_key=key, outcome=outcome, planned_minutes=planned,
+                               actual_minutes=did, milestone_complete=complete, note="ticks"))
+            if did < planned:
+                notes.append(f"{day:%a %d %b}: {planned - did} min of {ss[0].milestone_name} not done "
+                             "— spread over the next days.")
+        day += timedelta(days=1)
+    return new, notes

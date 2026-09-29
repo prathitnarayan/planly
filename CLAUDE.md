@@ -30,7 +30,8 @@ backend/app/
   planners/scheduler.py  replays the SAME simulation, records (day, milestone, minutes),
                          splits by kind (learn→practice→project…), places in slots, groups Mon–Sun sprints
   planners/load.py       course items -> study minutes (video x1.5, problems by difficulty); unsized = asked, not guessed
-  planners/progress.py   check-ins → progress (remaining + its source) → personal multiplier → replan
+  planners/progress.py   check-ins → progress (remaining + its source) → personal multiplier → replan;
+                         day_plan/close_days: Today checkboxes -> one check-in per milestone per closed day
   core/plan_file.py      TEMP: one saved plan in data/plan.json for the terminal scripts
   ai/llm.py              LLMClient, OpenAIClient, generate_validated (validate + 1 retry)
   ai/prompts.py          all prompts
@@ -141,8 +142,18 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
 - [x] Course sync (backend/sync): 12 sites + any site generically, measured load, course deadlines -> hard key dates,
       course_load fed to blueprint, coverage warning in /estimate-check
 - [x] Chrome extension + add-by-link (YouTube API / public pages) + Courses panel on the goal page
+- [x] Today checkboxes (GET /today, PUT /ticks; 004_ticks.sql). Past days auto-close on /today or /replan:
+      ticked = done, some = partial, none = missed; last planned piece ticked = milestone complete.
 - [ ] Manual lecture ticks in the app; Codeforces/LeetCode solved counts via their APIs
 - Later: web research, PDF parsing, ML duration model, what-if simulation
+
+## Today / ticks rules
+- Ticks never change today's list; it's the replan from today with check-ins up to yesterday (stable ids
+  "day|milestone|kind|index"). Only when a day is over are ticks turned into check-ins.
+- Missed work is never piled onto the next day: the simulation fills each day only up to sustainable
+  capacity, so it spreads forward (and feasibility flags a deadline if it no longer fits).
+- The browser sends its local date (server is UTC); trusted only within ±1 day of the server's date.
+- Frontend calls /today BEFORE /replan (sequentially) so a day is closed exactly once.
 
 ## Course sync rules
 - Logged-in reading happens ONLY in the user's own browser (extension) or laptop (sync tool). The server
