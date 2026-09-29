@@ -14,9 +14,11 @@ from datetime import date
 from pydantic import BaseModel, Field
 
 from app.ai.llm import LLMClient, Message, generate_validated
-from app.ai.prompts import BLUEPRINT_SYSTEM, CORRECTION_SYSTEM, GOAL_CHECK_SYSTEM, INTERVIEW_SYSTEM
+from app.ai.prompts import (
+    BLUEPRINT_SYSTEM, CORRECTION_SYSTEM, GOAL_CHECK_SYSTEM, INTERVIEW_SYSTEM, REALITY_SYSTEM,
+)
 from app.schemas.blueprint import GoalBlueprint
-from app.schemas.interview import GoalCheck, GoalProfile, InterviewTurn
+from app.schemas.interview import GoalCheck, GoalProfile, InterviewTurn, RealityCheck
 
 
 class InterviewState(BaseModel):
@@ -27,6 +29,7 @@ class InterviewState(BaseModel):
     deadline_forced: bool = False   # the code already asked the deadline question
     benchmark_forced: bool = False  # the code already asked the benchmark question
     done: bool = False
+    reality: RealityCheck | None = None   # typical prep time for well-known goals (asked once)
 
     @property
     def current_question(self) -> str | None:
@@ -183,3 +186,12 @@ def generate_blueprint(
         context={"key_dates": known, "benchmarks": set(profile.benchmark_map())},
     )
     return drop_schedule_questions(bp)
+
+
+def reality_check(llm: LLMClient, goal: str, profile: GoalProfile) -> RealityCheck:
+    """Is this a well-known goal (UPSC, CAT, a marathon...) and how long does it usually take?
+    Only the typical RANGE comes from the model; comparing it with the user's runway is code."""
+    brief = {"goal": goal, "background": profile.current_level, "target": profile.target_outcome,
+             "notes": profile.notes}
+    return generate_validated(llm, RealityCheck, REALITY_SYSTEM,
+                              [{"role": "user", "content": "Reality check as JSON for:\n" + json.dumps(brief)}])

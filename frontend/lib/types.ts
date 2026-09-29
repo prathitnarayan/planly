@@ -214,3 +214,13 @@ export type LearnedView = {
   };
   notes: string[]; goal_order: string[]; has_shared_capacity: boolean;
 };
+
+export type RealityView = {
+  check: { known: boolean; name: string | null; typical_hours_low: number | null; typical_hours_high: number | null;
+           typical_months_low: number | null; typical_months_high: number | null } | null;
+  verdict: {
+    level: "unknown" | "ok" | "tight" | "unrealistic"; headline: string | null; lines: string[]; suggestions: string[];
+    months_left: number | null; hours_available: number | null; needed_hours_per_week: number | null;
+    share_of_minimum: number | null; earliest_realistic: string | null;
+  };
+};

@@ -152,3 +152,28 @@ class GoalCheck(BaseModel):
     is_goal: bool
     suggested_goal: str | None = None
     background: str | None = None
+
+
+class RealityCheck(BaseModel):
+    """Commonly quoted prep time for a well-known goal (an AI ESTIMATE, labelled as such).
+    Code compares it with the user's real runway in planners/reality.py."""
+
+    known: bool
+    name: str | None = None
+    typical_hours_low: float | None = Field(default=None, gt=0)
+    typical_hours_high: float | None = Field(default=None, gt=0)
+    typical_months_low: float | None = Field(default=None, gt=0)
+    typical_months_high: float | None = Field(default=None, gt=0)
+    basis: str | None = None
+    adjusted_for: str | None = None
+    scope_suggestions: list[str] = Field(default_factory=list, max_length=3)
+
+    @model_validator(mode="after")
+    def ranges_make_sense(self) -> "RealityCheck":
+        if not self.known:
+            return self
+        if not (self.typical_hours_low and self.typical_months_low):
+            raise ValueError("a known goal needs typical_hours_low and typical_months_low")
+        self.typical_hours_high = max(self.typical_hours_high or self.typical_hours_low, self.typical_hours_low)
+        self.typical_months_high = max(self.typical_months_high or self.typical_months_low, self.typical_months_low)
+        return self

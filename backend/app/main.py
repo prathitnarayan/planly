@@ -31,8 +31,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.ai.goal_intake import (
-    answer_question, apply_correction, check_goal, generate_blueprint, start_interview,
+    answer_question, apply_correction, check_goal, generate_blueprint, reality_check, start_interview,
 )
+from app.planners.reality import RealityVerdict, assess
 from app.ai.source_extract import extract_source
 from app.ai.llm import LLMClient, LLMOutputError, OpenAIClient
 from app.core import config
@@ -57,10 +58,10 @@ from app.planners.progress import (
 from app.planners.tasks import video_key
 from app.planners.scheduler import Schedule, build_schedule
 from app.schemas.blueprint import GoalBlueprint
-from app.schemas.interview import GoalCheck, GoalProfile
+from app.schemas.interview import GoalCheck, GoalProfile, RealityCheck
 from app.schemas.source import CourseSource, SourceItem, parse_duration
 
-app = FastAPI(title="Planly API", version="0.9.0")
+app = FastAPI(title="Planly API", version="0.10.0")
 
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
@@ -335,6 +336,7 @@ def correct_profile(goal_id: str, body: TextIn, ctx: Ctx = Depends(),
     if not body.text.strip():
         raise HTTPException(status_code=422, detail="correction is empty")
     rec.interview = llm_call(apply_correction, llm, rec.interview, body.text)
+    rec.interview.reality = None      # the goal/background may have changed: ask again
     rec.blueprint = None
     ctx.save(rec)
     return to_view(rec)
@@ -778,6 +780,31 @@ def set_tick(goal_id: str, body: Tick, ctx: Ctx = Depends()) -> TodayView:
     rec.ticks.days[body.day.isoformat()] = sorted(ids)
     ctx.save(rec)
     return _today_view(ctx, rec, today, save_auto=False)
+
+
+# ---------- reality check: usual prep time for well-known goals vs your runway ----------
+
+class RealityView(BaseModel):
+    check: RealityCheck | None
+    verdict: RealityVerdict
+
+
+@app.get("/goals/{goal_id}/reality", response_model=RealityView)
+def goal_reality(goal_id: str, today: date | None = None, ctx: Ctx = Depends(),
+                 llm: LLMClient = Depends(get_llm)) -> RealityView:
+    """Asked once per goal (after the interview), then compared in code with the deadline and
+    your free time. Warns about UPSC-in-a-month; never blocks."""
+    rec = ctx.load(goal_id)
+    if not rec.interview.done:
+        raise HTTPException(status_code=409, detail="finish the interview first")
+    if rec.interview.reality is None:
+        rec.interview.reality = llm_call(reality_check, llm, rec.interview.goal, rec.interview.profile)
+        ctx.save(rec)
+    cap = ctx.base_capacity(rec)
+    weekly = cap.weekly_summary()["sustainable_hours"] if cap else None
+    verdict = assess(rec.interview.reality, today if _plausible_today(today) and today else server_today(),
+                     rec.interview.profile.deadline, weekly)
+    return RealityView(check=rec.interview.reality, verdict=verdict)
 
 
 # ---------- you: shared free time, goal priority, what Planly learned ----------

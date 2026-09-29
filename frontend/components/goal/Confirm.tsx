@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { Button, ErrorNote, Label, Textarea } from "@/components/ui";
+import { Reality } from "@/components/goal/Reality";
 import { api } from "@/lib/api";
 import type { GoalView } from "@/lib/types";
 
@@ -45,6 +46,7 @@ export function Confirm({ goal, onChange, onBuilt }: {
 
   return (
     <div>
+      <Reality goalId={goal.id} />
       <p className="mb-4 text-xl">Here&apos;s what I understood.</p>
       <dl className="mb-8 divide-y divide-line border-y border-line">
         {goal.summary.map((line, i) => {

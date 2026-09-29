@@ -36,6 +36,8 @@ backend/app/
   planners/integrity.py  evidence vs ticks: verified / partial / self / mismatch; trust, streak, owed minutes, locks
   planners/learning.py   Outcome rows (one per planned session of each closed day) -> learned weekday reliability
                          + video pace (real page time / video watched); recency-weighted, shrunk to defaults
+  planners/reality.py    reality check: AI gives the commonly quoted prep range for WELL-KNOWN goals (UPSC, CAT,
+                         marathon...); code compares with deadline + free time -> ok / tight / unrealistic (warn only)
   planners/pool.py       ONE pool of free time for all goals: goals plan in priority order, lower goals get the
                          leftover time (exact times cut out of their slots via CapacityProfile.taken)
   core/plan_file.py      TEMP: one saved plan in data/plan.json for the terminal scripts
@@ -157,6 +159,8 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
       strict consequences (no credit, +25% owed, trust, streak, evidence-only mode, 3-in-7 lock). 005_integrity.sql
 - [x] Learning stage 1 + shared time pool (API 0.9.0, 006_learning.sql): weekday reliability & video pace learned
       nightly from outcomes and used in planning; goals share one capacity in priority order (/me/goal-order)
+- [x] Reality check (API 0.10.0): GET /goals/{id}/reality, asked once per goal (reset on correction), stored in
+      interview.reality (no migration); card on the confirm step, and on the plan page when tight/unrealistic
 - [ ] Learning stage 2 (crowd priors per course item) and 3 (model); long-haul mode (phases, rolling detail,
       revision cycles, books, mock scores, fixed daily blocks)
 - [ ] Codeforces/LeetCode solved via their APIs (stronger practice evidence); trust per user instead of per goal
@@ -171,6 +175,11 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
 - Frontend calls /today BEFORE /replan (sequentially) so a day is closed exactly once.
 - A day with nothing to tick (plan starts later / free day) shows "Next up" (preview, hatched boxes) and,
   before the plan starts, "Start today instead" (POST /start-today; only if nothing is logged yet).
+
+## Reality check rules
+- The model only says whether a goal is well-known and the usual range (hours + months), labelled an AI estimate.
+  Code does the comparison: unrealistic < 50% of the usual minimum (months OR hours), tight < 100%.
+- It warns and suggests (a later attempt date, narrower goals); it never blocks the plan.
 
 ## Learning + shared pool rules
 - Learned numbers only kick in with enough evidence (3 sessions per weekday, 3 lectures for pace) and are

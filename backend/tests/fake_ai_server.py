@@ -16,7 +16,7 @@ import json
 import uvicorn
 
 from app.ai.prompts import (
-    BLUEPRINT_SYSTEM, CORRECTION_SYSTEM, GOAL_CHECK_SYSTEM, SOURCE_EXTRACT_SYSTEM,
+    BLUEPRINT_SYSTEM, CORRECTION_SYSTEM, GOAL_CHECK_SYSTEM, REALITY_SYSTEM, SOURCE_EXTRACT_SYSTEM,
 )
 from app.core import config
 from app.main import app, get_llm
@@ -98,6 +98,15 @@ class ScriptedAI:
     """Answers by looking at which prompt it got — no network, deterministic."""
 
     def complete_json(self, system, messages):
+        if system == REALITY_SYSTEM:
+            if "upsc" in messages[-1]["content"].lower():
+                return json.dumps({"known": True, "name": "UPSC Civil Services (Prelims + Mains)",
+                                   "typical_hours_low": 1500, "typical_hours_high": 2500,
+                                   "typical_months_low": 10, "typical_months_high": 18,
+                                   "basis": "Commonly cited by aspirants and coaching institutes",
+                                   "scope_suggestions": ["Finish Polity (Laxmikanth) + 300 Prelims MCQs",
+                                                         "Read NCERTs class 6-12 for History and Geography"]})
+            return json.dumps({"known": False})
         if system == SOURCE_EXTRACT_SYSTEM:
             return json.dumps(fake_extract(json.loads(messages[-1]["content"].split("\n", 1)[1])))
         if system.startswith(GOAL_CHECK_SYSTEM[:40]):
