@@ -25,6 +25,7 @@ from app.ai.goal_intake import InterviewState
 from app.planners.capacity import CapacityProfile
 from app.planners.progress import CheckIn
 from app.schemas.blueprint import GoalBlueprint
+from app.schemas.source import CourseSource
 
 
 class GoalRecord(BaseModel):
@@ -35,6 +36,7 @@ class GoalRecord(BaseModel):
     checkins: list[CheckIn] = Field(default_factory=list)
     plan_start: date | None = None        # first planned day (set when capacity is first saved)
     checked_through: date | None = None   # last day the user has checked in for
+    sources: list[CourseSource] = Field(default_factory=list)   # synced course pages (003)
 
     @property
     def title(self) -> str:
@@ -165,6 +167,11 @@ class PostgresRepo:
         from psycopg.types.json import Jsonb
         return Jsonb(model.model_dump(mode="json")) if model is not None else None
 
+    @staticmethod
+    def _jsonlist(models: list[BaseModel]):
+        from psycopg.types.json import Jsonb
+        return Jsonb([m.model_dump(mode="json") for m in models])
+
     def create(self, user_id, interview):
         with self.pool.connection() as conn:
             row = conn.execute(
@@ -178,7 +185,7 @@ class PostgresRepo:
             return None
         with self.pool.connection() as conn:
             row = conn.execute(
-                """select interview, blueprint, capacity, plan_start, checked_through
+                """select interview, blueprint, capacity, plan_start, checked_through, sources
                    from public.goals where id = %s and user_id = %s""",
                 (goal_id, user_id),
             ).fetchone()
@@ -198,6 +205,7 @@ class PostgresRepo:
             capacity=CapacityProfile.model_validate(row[2]) if row[2] else None,
             plan_start=row[3],
             checked_through=row[4],
+            sources=[CourseSource.model_validate(x) for x in (row[5] or [])],
             checkins=[
                 CheckIn(day=c[0], milestone_key=c[1], outcome=c[2], planned_minutes=c[3],
                         actual_minutes=c[4], milestone_complete=c[5], remaining_minutes=c[6], note=c[7])
@@ -225,10 +233,11 @@ class PostgresRepo:
         with self.pool.connection() as conn:
             cur = conn.execute(
                 """update public.goals set title = %s, interview = %s, blueprint = %s, capacity = %s,
-                          plan_start = %s, checked_through = %s
+                          plan_start = %s, checked_through = %s, sources = %s
                    where id = %s and user_id = %s""",
                 (rec.title, self._json(rec.interview), self._json(rec.blueprint),
-                 self._json(rec.capacity), rec.plan_start, rec.checked_through, rec.id, user_id),
+                 self._json(rec.capacity), rec.plan_start, rec.checked_through,
+                 self._jsonlist(rec.sources), rec.id, user_id),
             )
             if cur.rowcount != 1:
                 raise KeyError(rec.id)

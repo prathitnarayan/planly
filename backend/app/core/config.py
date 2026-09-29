@@ -39,3 +39,10 @@ def check_safe_config() -> None:
 FRONTEND_ORIGINS = [
     o.strip() for o in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(",") if o.strip()
 ]
+
+# Where the laptop sync tool (backend/sync) sends course pages. Your Render URL, or local.
+PLANLY_API_URL = os.getenv("PLANLY_API_URL", "http://localhost:8000").rstrip("/")
+
+# Optional: exact YouTube durations for playlists pasted in the app and videos embedded in
+# course pages. Free key: Google Cloud Console -> YouTube Data API v3 -> Credentials.
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")

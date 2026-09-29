@@ -164,13 +164,16 @@ def transcript(messages: list[Message]) -> list[dict[str, str]]:
 
 
 def generate_blueprint(
-    llm: LLMClient, goal: str, profile: GoalProfile, messages: list[Message] | None = None
+    llm: LLMClient, goal: str, profile: GoalProfile, messages: list[Message] | None = None,
+    course_load: list[dict] | None = None,
 ) -> GoalBlueprint:
     brief = {
         "goal": goal,
         "what_we_know": profile.model_dump(mode="json"),
         "interview_transcript": transcript(messages or []),
     }
+    if course_load:
+        brief["course_load"] = course_load
     messages: list[Message] = [
         {"role": "user", "content": "Build the blueprint as JSON for:\n" + json.dumps(brief, indent=2)}
     ]

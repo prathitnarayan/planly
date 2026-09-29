@@ -167,3 +167,17 @@ export type CheckIn = {
   actual_minutes: number;
   milestone_complete?: boolean;
 };
+
+export type SourceItem = {
+  title: string; section: string | null; kind: string; minutes: number | null;
+  duration_text: string | null; due: string | null; difficulty: string | null; done: boolean; url: string | null;
+};
+export type KindLoad = { kind: string; items: number; remaining: number; shown_minutes: number; study_minutes: number };
+export type SourceLoad = {
+  url: string; title: string; platform: string; items: number; done: number; study_minutes: number;
+  by_kind: KindLoad[]; unsized: string[]; due: { title: string; kind: string; due: string }[];
+};
+export type SourceView = { load: SourceLoad; items: SourceItem[]; synced_at: string };
+export type SyncResult = {
+  load: SourceLoad; items: SourceItem[]; key_dates_added: string[]; key_dates_moved: string[]; messages: string[];
+};

@@ -1,0 +1,4 @@
+# Only for the course sync tool on your laptop (python -m sync). Not needed on Render.
+-r requirements.txt
+playwright>=1.45
+yt-dlp>=2024.8

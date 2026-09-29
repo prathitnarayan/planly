@@ -15,7 +15,9 @@ import json
 
 import uvicorn
 
-from app.ai.prompts import BLUEPRINT_SYSTEM, CORRECTION_SYSTEM, GOAL_CHECK_SYSTEM
+from app.ai.prompts import (
+    BLUEPRINT_SYSTEM, CORRECTION_SYSTEM, GOAL_CHECK_SYSTEM, SOURCE_EXTRACT_SYSTEM,
+)
 from app.core import config
 from app.main import app, get_llm
 
@@ -70,10 +72,34 @@ BLUEPRINT = {
 }
 
 
+def fake_extract(brief: dict) -> dict:
+    """Crude stand-in for the AI reader: 'Title — 12:34' lines under 'Week N' headings."""
+    import re
+    items, section = [], brief.get("previous_section")
+    for line in brief["page_text"].splitlines():
+        line = line.strip()
+        if re.fullmatch(r"Week \d+", line):
+            section = line
+            continue
+        if " — " not in line or line.startswith("==="):
+            continue
+        title, rest = line.split(" — ", 1)
+        due = re.search(r"Due (.+)", rest)
+        items.append({
+            "title": title, "section": section,
+            "kind": "assignment" if "Assignment" in title else ("reading" if "Reading" in title else "video"),
+            "duration_text": None if due else rest.replace("✓ Completed", "").strip(),
+            "due_text": due.group(1) if due else None, "done": "Completed" in rest,
+        })
+    return {"course_title": None, "items": items}
+
+
 class ScriptedAI:
     """Answers by looking at which prompt it got — no network, deterministic."""
 
     def complete_json(self, system, messages):
+        if system == SOURCE_EXTRACT_SYSTEM:
+            return json.dumps(fake_extract(json.loads(messages[-1]["content"].split("\n", 1)[1])))
         if system.startswith(GOAL_CHECK_SYSTEM[:40]):
             text = messages[-1]["content"].lower()
             is_goal = not any(w in text for w in (" is done", "not started", "i know"))

@@ -16,22 +16,27 @@ Flow:
   PUT  /goals/{id}/capacity    {slots...}                -> weekly free time
   GET  /goals/{id}/replan                                -> feasibility + schedule from today
   POST /goals/{id}/checkins    {"checkins": [...]}       -> log what happened, replan
+  POST /goals/{id}/sources/page {url, platform, text}    <- sync tool: course page -> items -> load
+  GET  /goals/{id}/sources                               -> courses + measured work left
 """
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from functools import lru_cache
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.ai.goal_intake import (
     answer_question, apply_correction, check_goal, generate_blueprint, start_interview,
 )
+from app.ai.source_extract import extract_source
 from app.ai.llm import LLMClient, LLMOutputError, OpenAIClient
 from app.core import config
+from app.core import web_read
 from app.core.auth import current_user
 from app.core.estimate_log import make_row
 from app.core.repo import (
@@ -39,11 +44,15 @@ from app.core.repo import (
 )
 from app.planners.capacity import CapacityProfile
 from app.planners.estimate_check import EstimateWarning, check_estimates
+from app.planners.load import (
+    SourceLoad, blueprint_brief, course_key_dates, coverage_warning, source_load,
+)
 from app.planners.feasibility import FeasibilityResult, check_feasibility, resolve_items
 from app.planners.progress import CheckIn, DueSession, ReplanResult, due_sessions, replan
 from app.planners.scheduler import Schedule, build_schedule
 from app.schemas.blueprint import GoalBlueprint
 from app.schemas.interview import GoalCheck, GoalProfile
+from app.schemas.source import CourseSource, SourceItem, parse_duration
 
 app = FastAPI(title="Planly API", version="0.4.0")
 
@@ -274,7 +283,8 @@ def make_blueprint(goal_id: str, ctx: Ctx = Depends(), llm: LLMClient = Depends(
     if not rec.interview.done:
         raise HTTPException(status_code=409, detail="finish the interview first")
     rec.blueprint = llm_call(
-        generate_blueprint, llm, rec.interview.goal, rec.interview.profile, rec.interview.messages
+        generate_blueprint, llm, rec.interview.goal, rec.interview.profile, rec.interview.messages,
+        [blueprint_brief(s, date.today()) for s in rec.sources],
     )
     ctx.save(rec)
     return rec.blueprint
@@ -336,8 +346,13 @@ class EstimateCheck(BaseModel):
 @app.get("/goals/{goal_id}/estimate-check", response_model=EstimateCheck)
 def estimate_check(goal_id: str, ctx: Ctx = Depends()) -> EstimateCheck:
     rec = ctx.load(goal_id)
-    warnings = check_estimates(require_blueprint(rec), rec.interview.profile.benchmark_map())
-    return EstimateCheck(warnings=warnings, messages=[w.message for w in warnings])
+    bp = require_blueprint(rec)
+    warnings = check_estimates(bp, rec.interview.profile.benchmark_map())
+    messages = [w.message for w in warnings]
+    covered = coverage_warning(sum(m.estimated_hours for m in bp.milestones), rec.sources, date.today())
+    if covered:
+        messages.append(covered)
+    return EstimateCheck(warnings=warnings, messages=messages)
 
 
 # ---------- feasibility + schedule (capacity passed in: try "what if" without saving) ----------
@@ -477,6 +492,138 @@ def get_replan(goal_id: str, today: date | None = None, ctx: Ctx = Depends()) ->
     if rec.checked_through and rec.checked_through >= start:
         start = rec.checked_through + timedelta(days=1)
     return _replan(rec, rec.checkins, start)
+
+
+# ---------- courses: synced from the real course pages by backend/sync ----------
+
+class SourcePage(BaseModel):
+    url: str = Field(min_length=4, max_length=2000)
+    platform: str = Field(min_length=1, max_length=40)
+    text: str = Field(min_length=1, max_length=1_000_000)
+    title: str | None = None
+    youtube_ids: list[str] = Field(default_factory=list, max_length=1000)   # embedded lectures
+
+
+class SourceLink(BaseModel):
+    url: str = Field(min_length=8, max_length=2000)
+
+
+class SourceItems(BaseModel):
+    """Already structured (e.g. a YouTube playlist read with exact durations): no AI needed."""
+    url: str = Field(min_length=4, max_length=2000)
+    platform: str = Field(min_length=1, max_length=40)
+    title: str
+    items: list[SourceItem] = Field(max_length=5000)
+
+
+class SyncResult(BaseModel):
+    load: SourceLoad
+    items: list[SourceItem]
+    key_dates_added: list[str]
+    key_dates_moved: list[str]
+    messages: list[str]
+
+
+class SourceView(BaseModel):
+    load: SourceLoad
+    items: list[SourceItem]
+    synced_at: datetime
+
+
+def _store_source(ctx: "Ctx", rec: GoalRecord, src: CourseSource) -> SyncResult:
+    today = date.today()
+    rec.sources = [s for s in rec.sources if s.url != src.url] + [src]
+    added, moved = [], []
+    kds = {k.key: k for k in rec.interview.profile.key_dates}
+    for kd in course_key_dates(src, today):
+        if kd.key not in kds:
+            rec.interview.profile.key_dates.append(kd)
+            added.append(f"{kd.label} — {kd.date:%a %d %b}")
+        elif kds[kd.key].date != kd.date:
+            kds[kd.key].date = kd.date
+            moved.append(f"{kd.label} — now {kd.date:%a %d %b}")
+    ctx.save(rec)
+    load = source_load(src, today)
+    messages = load.describe()
+    if not src.items:
+        messages.append("No study items found on that page. Is it the course contents page, "
+                        "and were you logged in?")
+    if (added or moved) and rec.blueprint:
+        messages.append("Course deadlines changed: regenerate the plan so it uses them.")
+    return SyncResult(load=load, items=src.items, key_dates_added=added, key_dates_moved=moved,
+                      messages=messages)
+
+
+@app.post("/goals/{goal_id}/sources/page", response_model=SyncResult)
+def sync_source_page(goal_id: str, body: SourcePage, ctx: Ctx = Depends(),
+                     llm: LLMClient = Depends(get_llm)) -> SyncResult:
+    """Text of a course page (read by the sync tool on the user's laptop) -> items -> measured load."""
+    rec = ctx.load(goal_id)
+    text = body.text + _embedded_video_lengths(body.youtube_ids)
+    src = llm_call(lambda: extract_source(llm, url=body.url, platform=body.platform,
+                                          text=text, title=body.title, today=date.today()))
+    return _store_source(ctx, rec, src)
+
+
+def _embedded_video_lengths(ids: list[str]) -> str:
+    """Exact lengths of YouTube lectures embedded in the page, for the reader to match up."""
+    if not ids or not config.YOUTUBE_API_KEY:
+        return ""
+    try:
+        vids = web_read.youtube_videos(ids)
+    except web_read.NotAvailable:
+        return ""
+    lines = [f"- {v['title']} | {v['duration']}" for v in vids.values()]
+    return "\n\n=== Embedded videos (exact lengths) ===\n" + "\n".join(lines) if lines else ""
+
+
+@app.post("/goals/{goal_id}/sources/link", response_model=SyncResult)
+def sync_source_link(goal_id: str, body: SourceLink, ctx: Ctx = Depends(),
+                     llm: LLMClient = Depends(get_llm)) -> SyncResult:
+    """Pasted in the app: a YouTube playlist (exact lengths) or a PUBLIC course page.
+    Anything behind a login goes through the Chrome extension instead."""
+    rec = ctx.load(goal_id)
+    url = body.url.strip()
+    try:
+        if web_read.playlist_id(url) and ("youtube.com" in url or "youtu.be" in url):
+            title, vids = web_read.youtube_playlist(url)
+            items = [SourceItem(title=v["title"], kind="video", duration_text=v["duration"],
+                                minutes=parse_duration(v["duration"]),
+                                url=f"https://www.youtube.com/watch?v={v['id']}") for v in vids]
+            return _store_source(ctx, rec, CourseSource(url=url, platform="youtube", title=title, items=items))
+        title, text = web_read.public_page(url)
+    except web_read.NotAvailable as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    host = (urlparse(url).hostname or "web").removeprefix("www.").split(".")[0]
+    src = llm_call(lambda: extract_source(llm, url=url, platform=host, text=text, title=title or None,
+                                          today=date.today()))
+    return _store_source(ctx, rec, src)
+
+
+@app.post("/goals/{goal_id}/sources", response_model=SyncResult)
+def sync_source_items(goal_id: str, body: SourceItems, ctx: Ctx = Depends()) -> SyncResult:
+    rec = ctx.load(goal_id)
+    return _store_source(ctx, rec, CourseSource(url=body.url, platform=body.platform,
+                                                title=body.title, items=body.items))
+
+
+@app.get("/goals/{goal_id}/sources", response_model=list[SourceView])
+def list_sources(goal_id: str, ctx: Ctx = Depends()) -> list[SourceView]:
+    rec = ctx.load(goal_id)
+    return [SourceView(load=source_load(s, date.today()), items=s.items, synced_at=s.synced_at)
+            for s in rec.sources]
+
+
+@app.delete("/goals/{goal_id}/sources")
+def delete_source(goal_id: str, url: str, ctx: Ctx = Depends()) -> dict:
+    """Removes the course. Deadlines it added stay (they may be in the plan); edit them if needed."""
+    rec = ctx.load(goal_id)
+    kept = [s for s in rec.sources if s.url != url]
+    if len(kept) == len(rec.sources):
+        raise HTTPException(status_code=404, detail="no course with that url")
+    rec.sources = kept
+    ctx.save(rec)
+    return {"deleted": url}
 
 
 # ---------- stateless, no login: experiment with a hand-written blueprint ----------

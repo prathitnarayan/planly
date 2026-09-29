@@ -29,11 +29,14 @@ backend/app/
   planners/estimate_check.py deliverable totals vs user's benchmarks → warnings (>1.5x or <0.5x)
   planners/scheduler.py  replays the SAME simulation, records (day, milestone, minutes),
                          splits by kind (learn→practice→project…), places in slots, groups Mon–Sun sprints
+  planners/load.py       course items -> study minutes (video x1.5, problems by difficulty); unsized = asked, not guessed
   planners/progress.py   check-ins → progress (remaining + its source) → personal multiplier → replan
   core/plan_file.py      TEMP: one saved plan in data/plan.json for the terminal scripts
   ai/llm.py              LLMClient, OpenAIClient, generate_validated (validate + 1 retry)
   ai/prompts.py          all prompts
-  ai/goal_intake.py      interview turns + blueprint generation
+  ai/goal_intake.py      interview turns + blueprint generation (gets measured course_load)
+  ai/source_extract.py   course page text -> items (chunked, merged). AI copies "12:34"/"15 Oct"; code parses
+  schemas/source.py      CourseSource / SourceItem, parse_duration, parse_due (code picks the year)
   core/config.py         .env settings
   core/auth.py           verifies Supabase JWTs (ES256/RS256 via public JWKS, legacy HS256); dev mode = fixed user
   core/repo.py           GoalRepo: InMemoryRepo (dev/tests) + PostgresRepo (Supabase). EVERY query filters by user_id
@@ -42,8 +45,16 @@ backend/app/
 backend/scripts/try_goal.py  interview → blueprint → estimates → feasibility → schedule → save
 backend/scripts/checkin.py   daily check-in → replan. Supabase by default (scripts/session.py remembers
                              sign-in via refresh token in data/session.json); --local = data/plan.json
+backend/sync/            LAPTOP tool: Playwright w/ saved login (data/browser/, no passwords stored),
+                         expand+scroll+follow, YouTube via yt-dlp -> POST /goals/{id}/sources[/page]. docs/COURSE_SYNC.md
+  core/web_read.py       server-side PUBLIC reads only: YouTube Data API (YOUTUBE_API_KEY), public pages
+                         (private/loopback addresses refused, redirects re-checked)
+extension/               Chrome MV3: per-site ON via optional_host_permissions (Chrome enforces), Planly login
+                         (Supabase refresh token in chrome.storage), lib/reader.js expands+scrolls+reads the page,
+                         background.js POSTs /sources/page and auto-re-syncs watched pages (<= every 6h)
+frontend/components/goal/Courses.tsx  "Your courses" panel: load per course, items by section, add by link
 backend/tests/           pytest; every planner function gets tests
-database/migrations/     001_planly.sql (+ 002_tracking.sql: plan_start, checked_through). Run in order.
+database/migrations/     001_planly.sql (+ 002_tracking.sql: plan_start, checked_through; 003_sources.sql: goals.sources). Run in order.
                          001_planly.sql — goals (JSONB docs) + append-only checkins / estimate_corrections, RLS
 docs/SUPABASE_SETUP.md   step-by-step connection guide
 docs/normalized_schema_future.sql  NOT applied — future row-per-milestone design
@@ -127,7 +138,19 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
 - [x] Frontend (frontend/): Next.js 16 + Tailwind, monochrome. Login (Supabase JS), goals, goal check,
       interview, confirm/correct, hours + estimate warnings, free time, plan, check-in. See frontend/README.md.
       Backend: CORS (FRONTEND_ORIGINS), /due, GET /blueprint, GET /capacity, replan starts at the right day.
+- [x] Course sync (backend/sync): 12 sites + any site generically, measured load, course deadlines -> hard key dates,
+      course_load fed to blueprint, coverage warning in /estimate-check
+- [x] Chrome extension + add-by-link (YouTube API / public pages) + Courses panel on the goal page
+- [ ] Manual lecture ticks in the app; Codeforces/LeetCode solved counts via their APIs
 - Later: web research, PDF parsing, ML duration model, what-if simulation
+
+## Course sync rules
+- Logged-in reading happens ONLY in the user's own browser (extension) or laptop (sync tool). The server
+  reads public data only. The extension touches a site only after the user switches it On.
+- Runs on the user's laptop only. Never store third-party passwords anywhere; the saved browser
+  session lives in backend/data/browser/. Read-only: no downloads, no DRM/CAPTCHA bypass.
+- AI copies durations/dates as text; parse_duration/parse_due turn them into numbers.
+- Items that can't be sized honestly (assignment with no length) go to `unsized`, never a made-up number.
 
 ## Frontend rules
 - Monochrome only: ink / paper / muted / line / soft tokens (app/globals.css). State via weight, rules and

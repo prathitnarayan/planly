@@ -4,11 +4,12 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { Confirm } from "@/components/goal/Confirm";
+import { Courses } from "@/components/goal/Courses";
 import { Estimates } from "@/components/goal/Estimates";
 import { FreeTime } from "@/components/goal/FreeTime";
 import { Interview } from "@/components/goal/Interview";
 import { Plan } from "@/components/goal/Plan";
-import { ErrorNote, Loading, PageTitle } from "@/components/ui";
+import { ErrorNote, Loading, PageTitle, Rule } from "@/components/ui";
 import { api } from "@/lib/api";
 import type { GoalView } from "@/lib/types";
 
@@ -54,6 +55,12 @@ export default function GoalPage() {
       {step === 4 && (
         <Plan goalId={id} hasCheckins={!!goal.checked_through}
               onEditHours={() => setEdit("hours")} onEditTime={() => setEdit("time")} />
+      )}
+      {goal.interview_done && (
+        <>
+          <Rule />
+          <Courses goalId={id} onChanged={reload} />
+        </>
       )}
       <ErrorNote error={error} />
     </>

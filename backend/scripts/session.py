@@ -51,11 +51,8 @@ def sign_out() -> None:
     SESSION_PATH.unlink(missing_ok=True)
 
 
-def current_user(interactive: bool = True) -> tuple[str, str]:
-    """
-    Return (user_id, email). Uses the saved session if it still works;
-    otherwise asks for email + password (once) and saves the new session.
-    """
+def _session(interactive: bool) -> tuple[str, str]:
+    """(access_token, email): the saved session if it still works, else sign in once."""
     if not (config.SUPABASE_URL and config.SUPABASE_ANON_KEY):
         raise SignInError("Set SUPABASE_URL and SUPABASE_ANON_KEY in backend/.env first.")
 
@@ -64,14 +61,26 @@ def current_user(interactive: bool = True) -> tuple[str, str]:
         try:
             data = _auth("token?grant_type=refresh_token", {"refresh_token": saved["refresh_token"]})
             _save(saved["email"], data["refresh_token"])
-            return verify_token(data["access_token"], config.SUPABASE_URL, config.SUPABASE_JWT_SECRET), saved["email"]
+            return data["access_token"], saved["email"]
         except (SignInError, KeyError):
             sign_out()   # expired or revoked: fall through to a fresh sign-in
 
     if not interactive:
         raise SignInError("Not signed in.")
-    email = input("Email: ").strip()
-    password = getpass.getpass("Password (hidden): ")
+    email = input("Planly email: ").strip()
+    password = getpass.getpass("Planly password (hidden): ")
     data = _auth("token?grant_type=password", {"email": email, "password": password})
     _save(email, data["refresh_token"])
-    return verify_token(data["access_token"], config.SUPABASE_URL, config.SUPABASE_JWT_SECRET), email
+    return data["access_token"], email
+
+
+def access_token(interactive: bool = True) -> str:
+    """A fresh token for calling the Planly API as yourself (used by backend/sync)."""
+    return _session(interactive)[0]
+
+
+def current_user(interactive: bool = True) -> tuple[str, str]:
+    """Return (user_id, email). Uses the saved session if it still works;
+    otherwise asks for email + password (once) and saves the new session."""
+    token, email = _session(interactive)
+    return verify_token(token, config.SUPABASE_URL, config.SUPABASE_JWT_SECRET), email

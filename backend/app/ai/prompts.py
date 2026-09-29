@@ -110,6 +110,12 @@ Rules:
   If the benchmark has parts, set "benchmark_part" on each milestone that
   corresponds to one (e.g. "video"), else null.
 - Never count the same work twice across milestones.
+- COURSES: if "course_load" is given, it was MEASURED by code from the user's real course
+  pages (video lengths, problem counts). Cover ALL remaining course work in milestones,
+  grouped by section/week so you stay within the milestone limit. The hours you give a
+  course must add up to AT LEAST its measured study hours; add time only for work the
+  measurement can't see (projects, revision). Items listed as "not sized" need your
+  estimate. Course deadlines are already in key_dates: reference them with due_by.
 - SKILLS CARRY OVER. The first deliverable that needs a new skill carries the
   "learn" hours for it. Later deliverables reuse it and cost noticeably less.
 - depends_on ONLY when a milestone truly cannot start without the other one's
@@ -173,4 +179,32 @@ Reply with a JSON object exactly like:
   "open_questions": ["..."],
   "anchors": {"assignment_2": "a1"}
 }
+"""
+
+
+SOURCE_EXTRACT_SYSTEM = """You read the text of a course / playlist / problem-sheet page and list
+the study items on it. You are a careful copier, not a planner.
+
+Rules:
+- One item per lecture, video, reading, problem, quiz, mock test, assignment or live class.
+  Skip navigation, ads, prices, reviews, instructor bios, footers.
+- duration_text: copy the length EXACTLY as written ("12:34", "1h 5m", "45 min"). Never
+  convert, add up or invent a duration. No length on the page -> null.
+- due_text: only if a due / deadline / exam date is written next to the item: copy it EXACTLY
+  as written ("15 Oct 2026, 11:59 PM", "15/10"). Never convert it or add a year. Else null.
+- done: true only if the page clearly marks it completed / watched / solved (tick, "Completed",
+  "Solved", 100%). Otherwise false.
+- kind: video | reading | practice | assignment | test | live | other.
+  Coding problems = practice. Graded work = assignment. Quiz / mock / exam = test.
+- difficulty: easy | medium | hard only if written on the page, else null.
+- section: the week / module / topic heading the item sits under. If the chunk starts in the
+  middle of a section, use the section name you are given as "previous section".
+- If a list of "Embedded videos (exact lengths)" is given, use those lengths for the matching
+  lectures.
+- Do not merge or summarise items. Do not number them yourself.
+
+Reply with a JSON object exactly like:
+{"course_title": "... or null",
+ "items": [{"title": "...", "section": "... or null", "kind": "video", "duration_text": "12:34",
+            "due_text": null, "difficulty": null, "done": false, "url": null}]}
 """

@@ -18,11 +18,20 @@ async function authHeader(): Promise<Record<string, string>> {
 /** Call the FastAPI backend as the signed-in user. Throws ApiError with the backend's message. */
 export async function api<T>(path: string, init: { method?: string; body?: unknown; query?: Record<string, string> } = {}): Promise<T> {
   const qs = init.query ? `?${new URLSearchParams(init.query)}` : "";
-  const res = await fetch(`${API}${path}${qs}`, {
-    method: init.method ?? (init.body === undefined ? "GET" : "POST"),
-    headers: { "Content-Type": "application/json", ...(await authHeader()) },
-    body: init.body === undefined ? undefined : JSON.stringify(init.body),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${API}${path}${qs}`, {
+      method: init.method ?? (init.body === undefined ? "GET" : "POST"),
+      headers: { "Content-Type": "application/json", ...(await authHeader()) },
+      body: init.body === undefined ? undefined : JSON.stringify(init.body),
+    });
+  } catch {
+    // The browser couldn't connect at all (server down, wrong URL, or blocked by CORS).
+    throw new ApiError(0,
+      `Can't reach the Planly API at ${API}. Is the backend running? ` +
+      `(cd backend && python -m uvicorn app.main:app --reload --reload-dir app). ` +
+      `Also open the app at http://localhost:3000, not 127.0.0.1 or a network address.`);
+  }
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
     try {

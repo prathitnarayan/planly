@@ -1,0 +1,62 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <span class="logo">planly<span class="dot">.</span></span>
+    <span class="right"><span id="who"></span> <button id="gear" class="link" title="Settings">Settings</button></span>
+  </header>
+
+  <section id="settings" hidden>
+    <p class="label">Settings</p>
+    <label>Planly API <input id="s-api" /></label>
+    <label>Planly app <input id="s-app" /></label>
+    <label>Supabase URL <input id="s-sb" /></label>
+    <label>Supabase anon key <input id="s-key" placeholder="eyJ... (public key, not service_role)" /></label>
+    <button id="s-save" class="primary">Save</button>
+    <button id="s-signout" class="link">Sign out of Planly</button>
+  </section>
+
+  <section id="signin" hidden>
+    <p class="label">Sign in to Planly</p>
+    <p class="muted">Your Planly account, same as the web app. Course sites use the login already in Chrome.</p>
+    <input id="email" type="email" placeholder="Email" />
+    <input id="password" type="password" placeholder="Password" />
+    <button id="signin-btn" class="primary">Sign in</button>
+  </section>
+
+  <section id="main" hidden>
+    <div id="notweb" hidden class="muted">Open a course page (the one that lists the lectures), then click Planly again.</div>
+    <div id="sitebox" hidden>
+      <div class="site">
+        <div>
+          <div class="site-name" id="site-name"></div>
+          <div class="muted small" id="site-host"></div>
+        </div>
+        <button id="toggle" class="toggle" aria-pressed="false">Off</button>
+      </div>
+      <p class="muted small" id="toggle-help">Planly can't see this site. Switch on to let it read the pages you sync here.</p>
+
+      <div id="on" hidden>
+        <label class="label" for="goal">Add this page to goal</label>
+        <select id="goal"></select>
+        <label class="check"><input id="auto" type="checkbox" checked /> Re-sync when I open this page (every 6h at most)</label>
+        <button id="sync" class="primary">Sync this page</button>
+        <p class="muted small">Use the page that lists the lectures / problems. It expands every week, reads titles, lengths and deadlines. Nothing is clicked that submits, buys or downloads.</p>
+      </div>
+    </div>
+
+    <div id="status" hidden>
+      <p class="label" id="status-title"></p>
+      <pre id="status-lines"></pre>
+      <a id="open-plan" target="_blank" hidden>Open the plan in Planly →</a>
+    </div>
+  </section>
+
+  <p id="error" class="error" hidden></p>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
