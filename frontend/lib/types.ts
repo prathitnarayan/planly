@@ -189,4 +189,5 @@ export type TodaySession = {
 export type TodayView = {
   day: string; sessions: TodaySession[]; planned_minutes: number; done_minutes: number;
   moved: string[]; closed: boolean; message: string | null;
+  next_day: string | null; next_sessions: TodaySession[]; can_start_today: boolean;
 };

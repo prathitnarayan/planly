@@ -154,6 +154,8 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
   capacity, so it spreads forward (and feasibility flags a deadline if it no longer fits).
 - The browser sends its local date (server is UTC); trusted only within ±1 day of the server's date.
 - Frontend calls /today BEFORE /replan (sequentially) so a day is closed exactly once.
+- A day with nothing to tick (plan starts later / free day) shows "Next up" (preview, hatched boxes) and,
+  before the plan starts, "Start today instead" (POST /start-today; only if nothing is logged yet).
 
 ## Course sync rules
 - Logged-in reading happens ONLY in the user's own browser (extension) or laptop (sync tool). The server
@@ -170,6 +172,10 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
 ## Frontend rules
 - Monochrome only: ink / paper / muted / line / soft tokens (app/globals.css). State via weight, rules and
   symbols (✓ ! ○), never colour. Dark mode = same tokens inverted.
+- Texture and motion instead of colour: .hatch = late / not yet, .strike draws itself when ticked,
+  .pop / .rise / .grow for feedback (all off under prefers-reduced-motion).
+- Plan page: Today card (ring + checkboxes) → verdict (need/have/finish + load bar) → milestone timeline
+  (bar = worked on, tall tick = due, hatched = late) → week strip (days under their weekday) → later weeks.
 - Pages only call the API (lib/api.ts adds the Supabase token). No planning logic in the frontend.
 - tests/fake_ai_server.py runs the real API with a scripted AI, for UI work without an AI key.
 

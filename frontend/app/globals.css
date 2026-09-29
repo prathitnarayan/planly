@@ -40,3 +40,27 @@ body {
 ::selection { background: var(--ink); color: var(--paper); }
 input, textarea, select { font: inherit; }
 :focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+/* ---------- motion (monochrome: movement and weight instead of colour) ---------- */
+@media (prefers-reduced-motion: no-preference) {
+  .pop { animation: pop 220ms ease-out; }
+  @keyframes pop { 0% { transform: scale(0.7); } 60% { transform: scale(1.15); } 100% { transform: scale(1); } }
+  .rise { animation: rise 360ms ease-out both; }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .grow { transition: width 500ms cubic-bezier(.2,.8,.2,1), height 500ms cubic-bezier(.2,.8,.2,1), stroke-dashoffset 600ms cubic-bezier(.2,.8,.2,1); }
+}
+
+/* A strike-through that DRAWS itself when a task is ticked (text-decoration can't animate). */
+.strike {
+  background-image: linear-gradient(currentColor, currentColor);
+  background-repeat: no-repeat;
+  background-position: 0 55%;
+  background-size: 0% 1.5px;
+  transition: background-size 320ms ease-out, color 200ms;
+}
+.strike[data-done="true"] { background-size: 100% 1.5px; color: var(--muted); }
+
+/* Hatched fill for "not yet / preview" — texture instead of colour. */
+.hatch {
+  background-image: repeating-linear-gradient(135deg, var(--line) 0 2px, transparent 2px 6px);
+}

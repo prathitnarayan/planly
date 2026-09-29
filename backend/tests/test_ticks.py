@@ -133,3 +133,15 @@ def test_api_replan_also_closes_past_days(goal):
     r = c.get(f"/goals/{gid}/replan", params={"today": wed.isoformat()}).json()
     assert r["today"] == wed.isoformat()
     assert len(repo.get(DEV_USER_ID, gid).checkins) == 2               # Mon + Tue closed as missed
+
+
+def test_api_before_start_shows_next_day_and_can_start_today(goal):
+    c, gid, clock, repo = goal
+    sat = MON - timedelta(days=2)
+    clock["today"] = sat
+    t = c.get(f"/goals/{gid}/today", params={"today": sat.isoformat()}).json()
+    assert t["sessions"] == [] and t["can_start_today"] is True
+    assert t["next_day"] == MON.isoformat() and sum(s["minutes"] for s in t["next_sessions"]) == 60
+    t = c.post(f"/goals/{gid}/start-today", json={"today": sat.isoformat()}).json()
+    assert t["planned_minutes"] == 60 and t["sessions"][0]["id"].startswith(sat.isoformat())
+    assert c.post(f"/goals/{gid}/start-today", json={"today": sat.isoformat()}).status_code == 409

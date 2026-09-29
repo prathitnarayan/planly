@@ -187,7 +187,11 @@ the study items on it. You are a careful copier, not a planner.
 
 Rules:
 - One item per lecture, video, reading, problem, quiz, mock test, assignment or live class.
-  Skip navigation, ads, prices, reviews, instructor bios, footers.
+  Skip navigation, ads, prices, reviews, instructor bios, footers, and anything that is not a
+  thing to study or solve: "About this sheet", FAQs, descriptions, section headings, filters,
+  progress counters ("12/455 done"). Section headings go in "section", not as items.
+- Problem sheets (DSA sheets, study plans): every problem row is one practice item, even if
+  the only text is the problem name.
 - duration_text: copy the length EXACTLY as written ("12:34", "1h 5m", "45 min"). Never
   convert, add up or invent a duration. No length on the page -> null.
 - due_text: only if a due / deadline / exam date is written next to the item: copy it EXACTLY

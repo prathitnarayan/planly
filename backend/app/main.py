@@ -56,7 +56,7 @@ from app.schemas.blueprint import GoalBlueprint
 from app.schemas.interview import GoalCheck, GoalProfile
 from app.schemas.source import CourseSource, SourceItem, parse_duration
 
-app = FastAPI(title="Planly API", version="0.6.0")
+app = FastAPI(title="Planly API", version="0.7.0")
 
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
@@ -533,13 +533,39 @@ class TodayView(BaseModel):
     moved: list[str]              # unfinished work from earlier days that was re-spread
     closed: bool = False          # today was already checked in on the check-in page
     message: str | None = None
+    next_day: date | None = None                               # when today has nothing: the next day that does
+    next_sessions: list[TodaySession] = Field(default_factory=list)   # preview only, not tickable yet
+    can_start_today: bool = False                              # plan starts later and nothing is logged yet
+
+
+def _next_planned(rec: GoalRecord, after: date) -> tuple[date | None, list[TodaySession]]:
+    """First day after `after` with sessions, as the plan stands now (preview)."""
+    start = max(after + timedelta(days=1), rec.plan_start or after)
+    plan = replan(rec.blueprint, _items(rec), rec.checkins, rec.capacity, today=start)
+    for sprint in plan.schedule.sprints:
+        for d in sprint.days:
+            if d.sessions:
+                sessions, _ = day_plan(rec.blueprint, _items(rec), rec.checkins, rec.capacity, d.day)
+                return d.day, sessions
+    return None, []
 
 
 def _today_view(rec: GoalRecord, today: date) -> TodayView:
+    view = _today_view_inner(rec, today)
+    if not view.sessions and not view.closed:
+        try:
+            view.next_day, view.next_sessions = _next_planned(rec, today)
+        except ValueError:
+            pass
+    return view
+
+
+def _today_view_inner(rec: GoalRecord, today: date) -> TodayView:
     moved = rec.ticks.notes if rec.ticks.notes_day == today else []
     if rec.plan_start and today < rec.plan_start:
         return TodayView(day=today, sessions=[], planned_minutes=0, done_minutes=0, moved=moved,
-                         message=f"Your plan starts {rec.plan_start:%a %d %b}.")
+                         message=f"Your plan starts {rec.plan_start:%a %d %b}.",
+                         can_start_today=not rec.checkins)
     if rec.checked_through and rec.checked_through >= today:
         return TodayView(day=today, sessions=[], planned_minutes=0, done_minutes=0, moved=moved, closed=True,
                          message="Today is already checked in.")
@@ -563,6 +589,25 @@ def get_today(goal_id: str, today: date | None = None, ctx: Ctx = Depends()) -> 
     require_blueprint(rec)
     today = _user_today(today)
     _close_past_days(ctx, rec, today)
+    return _today_view(rec, today)
+
+
+class StartToday(BaseModel):
+    today: date
+
+
+@app.post("/goals/{goal_id}/start-today", response_model=TodayView)
+def start_today(goal_id: str, body: StartToday, ctx: Ctx = Depends()) -> TodayView:
+    """'Start today instead': move the plan's first day to today (only before anything is logged)."""
+    rec = ctx.load(goal_id)
+    today = _user_today(body.today)
+    require_blueprint(rec)
+    if not rec.capacity:
+        raise HTTPException(status_code=409, detail="set capacity first: PUT /goals/{id}/capacity")
+    if rec.checkins or (rec.plan_start and rec.plan_start <= today):
+        raise HTTPException(status_code=409, detail="the plan has already started")
+    rec.plan_start = today
+    ctx.save(rec)
     return _today_view(rec, today)
 
 
