@@ -150,6 +150,10 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
 - Runs on the user's laptop only. Never store third-party passwords anywhere; the saved browser
   session lives in backend/data/browser/. Read-only: no downloads, no DRM/CAPTCHA bypass.
 - AI copies durations/dates as text; parse_duration/parse_due turn them into numbers.
+- The page reader never clicks links and never presses Back. If a click changes the page path, it stops
+  expanding (real bug 29 Sep: history.back() on Striver's sheet sent the tab to the previous page).
+  Sections that put state in ?query/#hash are fine.
+- /health returns the API version: check it after a deploy (0.5.0+ has course sync).
 - Items that can't be sized honestly (assignment with no length) go to `unsized`, never a made-up number.
 
 ## Frontend rules

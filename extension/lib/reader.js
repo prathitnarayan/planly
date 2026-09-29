@@ -6,7 +6,8 @@ export async function readCoursePage() {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const EXPAND = /^\s*(expand all|expand|show more|load more|view more|see more|see all|show all|view all|more lessons|show \d+ more)\b/i;
   const DANGER = /log ?out|sign ?out|delete|submit|buy|enrol|enroll|pay|unsubscribe|reset/i;
-  const startUrl = location.href;
+  const startPath = location.pathname;
+  let moved = false;
 
   function visible(el) {
     const r = el.getBoundingClientRect();
@@ -25,12 +26,16 @@ export async function readCoursePage() {
         const collapsed = el.getAttribute("aria-expanded") === "false";
         if (!collapsed && !EXPAND.test(label)) continue;
         if (DANGER.test(label)) continue;
-        if (el.tagName === "A" && el.getAttribute("href") && !el.getAttribute("href").startsWith("#")) continue;
+        const link = el.closest("a[href]");
+        if (link && !link.getAttribute("href").startsWith("#")) continue;   // a link = navigation, never click
         try { el.click(); clicked++; } catch {}
         await sleep(120);
-        if (location.href !== startUrl) { history.back(); await sleep(1500); }
+        // Some sheets (e.g. Striver's) put the open section in the URL (?step= / #...). That's fine.
+        // If a click took us to a different page, STOP clicking. Never press Back: that
+        // sent the tab to the previous page (real bug, 29 Sep).
+        if (location.pathname !== startPath) { moved = true; break; }
       }
-      if (!clicked) break;
+      if (!clicked || moved) break;
       await sleep(800);
     }
   }

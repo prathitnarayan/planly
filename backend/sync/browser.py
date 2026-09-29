@@ -176,12 +176,13 @@ def _expand_everything(page, url: str, rounds: int = 3, max_clicks: int = 300) -
                     continue
                 if re.search(r"log ?out|sign ?out|delete|submit|buy|enrol|enroll|pay", label, re.I):
                     continue
+                if el.evaluate("e => { const a = e.closest('a[href]'); return !!a && !a.getAttribute('href').startsWith('#'); }"):
+                    continue                        # a link = navigation, never click
                 el.click(timeout=1500)
                 clicked += 1
                 page.wait_for_timeout(120)
-                if page.url != start_url:           # a toggle navigated: go back
-                    page.go_back(wait_until="domcontentloaded")
-                    _settle(page, 5000)
+                if urlparse(page.url).path != urlparse(start_url).path:
+                    return                          # moved to another page: stop, don't press Back
             except Exception:
                 continue
         if not clicked:

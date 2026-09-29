@@ -54,7 +54,7 @@ from app.schemas.blueprint import GoalBlueprint
 from app.schemas.interview import GoalCheck, GoalProfile
 from app.schemas.source import CourseSource, SourceItem, parse_duration
 
-app = FastAPI(title="Planly API", version="0.4.0")
+app = FastAPI(title="Planly API", version="0.5.0")
 
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
@@ -192,7 +192,8 @@ def tomorrow() -> date:
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "auth": config.AUTH_MODE, "storage": "postgres" if config.DATABASE_URL else "memory"}
+    return {"ok": True, "version": app.version, "auth": config.AUTH_MODE,
+            "storage": "postgres" if config.DATABASE_URL else "memory"}
 
 
 @app.get("/me")
