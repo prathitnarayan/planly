@@ -1,10 +1,3 @@
-mkdir -p .github/workflows
-cat > .github/workflows/planly-cron.yml <<'EOF'
-# Every 15 minutes: lets Planly send morning/evening Telegram messages on time
-# (and keeps the free Render instance from sleeping through them).
-# Needs two repo secrets: Settings -> Secrets and variables -> Actions:
-#   PLANLY_API_URL      e.g. https://planly-u3y3.onrender.com
-#   PLANLY_CRON_SECRET  the same value as CRON_SECRET on Render
 name: planly-cron
 on:
   schedule:
@@ -19,7 +12,3 @@ jobs:
         run: |
           curl -fsS --max-time 120 -X POST "${{ secrets.PLANLY_API_URL }}/cron/notify" \
                -H "X-Cron-Secret: ${{ secrets.PLANLY_CRON_SECRET }}"
-EOF
-git add .github/workflows/planly-cron.yml
-git commit -m "Add Planly cron workflow"
-git push
