@@ -13,9 +13,9 @@ Both are optional. Until the backend has the settings below, Planly's Settings p
 ---
 
 ## 1. Shared secrets (Render → planly service → Environment)
-Generate two random strings (run twice):
+Generate three random strings (run it three times; on a Mac the command is `python3`):
 ```
-python -c "import secrets;print(secrets.token_urlsafe(48))"
+python3 -c "import secrets;print(secrets.token_urlsafe(48))"
 ```
 | Key | Value |
 |---|---|
@@ -32,7 +32,7 @@ python -c "import secrets;print(secrets.token_urlsafe(48))"
    |---|---|
    | `TELEGRAM_BOT_TOKEN` | the token |
    | `TELEGRAM_BOT_USERNAME` | the username, without @ |
-   | `TELEGRAM_WEBHOOK_SECRET` | random string #3 (letters/digits/_ only) |
+   | `TELEGRAM_WEBHOOK_SECRET` | random string #3 (letters, digits, `_` and `-` only — the command above gives exactly that) |
 3. Planly registers its webhook with Telegram by itself the first time someone connects.
 4. In Planly → **Settings** → **Connect Telegram** → Telegram opens → tap **Start**. Done.
 
@@ -60,4 +60,17 @@ No GitHub? Use cron-job.org (free): POST to `…/cron/notify` every 15 min with 
 6. Planly → **Settings** → **Connect Google Calendar**.
 
 ## 5. Database
-Run `database/migrations/007_integrations.sql` in Supabase (SQL Editor).
+Run in Supabase (SQL Editor), in order, if you haven't yet: `007_integrations.sql`, then `008_habits.sql`.
+Both are safe to run twice.
+
+## 6. Habits + the daily quote (API 0.12.0)
+Nothing to configure. Once Telegram is connected:
+- **Every morning**: the day's quote comes first (it's what shows on the lock screen), then today's tasks,
+  then habit streaks, with "yesterday?" buttons for any habit left blank. People with no goals or
+  habits still get the quote. Switch it off in Settings → "Daily quote".
+- **Evening**: only if a task is unticked or a habit isn't answered for today.
+- **Heads-up**: at most one a day, 30 minutes before *your* usual urge time. It only starts after
+  you've logged a few urges (/urge in Telegram, or "Urge right now" on the Habits page).
+- Telegram shows a habit's **lock-screen name** (e.g. "H1") instead of its real name, if you set one.
+- Bot commands: `/today`, `/urge`, `/stop`.
+

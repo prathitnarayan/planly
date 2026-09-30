@@ -33,14 +33,15 @@ def call(method: str, payload: dict) -> dict:
     return data.get("result") or {}
 
 
-def keyboard(buttons: list[tuple[str, str]]) -> dict | None:
-    """[(label, callback_data)] -> one button per row."""
+def keyboard(buttons: list) -> dict | None:
+    """Rows of [(label, callback_data), ...]. A bare (label, data) tuple is a row of one."""
     if not buttons:
         return None
-    return {"inline_keyboard": [[{"text": label, "callback_data": data}] for label, data in buttons]}
+    rows = [[row] if isinstance(row, tuple) else row for row in buttons]
+    return {"inline_keyboard": [[{"text": label, "callback_data": data} for label, data in row] for row in rows]}
 
 
-def send(chat_id: int, text: str, buttons: list[tuple[str, str]] | None = None) -> dict:
+def send(chat_id: int, text: str, buttons: list | None = None) -> dict:
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     kb = keyboard(buttons or [])
     if kb:
@@ -48,7 +49,7 @@ def send(chat_id: int, text: str, buttons: list[tuple[str, str]] | None = None) 
     return call("sendMessage", payload)
 
 
-def edit(chat_id: int, message_id: int, text: str, buttons: list[tuple[str, str]] | None = None) -> None:
+def edit(chat_id: int, message_id: int, text: str, buttons: list | None = None) -> None:
     payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML",
                "disable_web_page_preview": True, "reply_markup": keyboard(buttons or []) or {"inline_keyboard": []}}
     try:
@@ -78,4 +79,10 @@ def ensure_webhook() -> None:
     if info.get("url") != url:
         call("setWebhook", {"url": url, "secret_token": config.TELEGRAM_WEBHOOK_SECRET,
                             "allowed_updates": ["message", "callback_query"]})
+        call("setMyCommands", {"commands": COMMANDS})
     _webhook_checked = True
+
+
+COMMANDS = [{"command": "today", "description": "Today's quote, tasks and habits"},
+            {"command": "urge", "description": "Log a craving right now"},
+            {"command": "stop", "description": "Disconnect this chat"}]

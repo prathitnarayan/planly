@@ -374,3 +374,27 @@ def test_telegram_lookups_and_integrations_roundtrip(repo):
     assert repo.user_by_chat(4242) == ALICE and ALICE in repo.telegram_users()
     got = repo.get_settings(ALICE)
     assert got.timezone == "Europe/London" and got.google.connected and got.telegram.link_code is None
+
+
+def test_habits_roundtrip_and_isolation(repo):
+    from datetime import datetime, timezone
+    from app.planners.habits import Habit, Urge
+    h = Habit(name="No smoking", why="lungs", label="H1", started=date(2026, 9, 1))
+    repo.save_habit(ALICE, h)
+    assert repo.get_habit(ALICE, h.id) == h and repo.get_habit(BOB, h.id) is None
+    with pytest.raises(KeyError):
+        repo.save_habit(BOB, h.model_copy(update={"name": "stolen"}))          # can't overwrite Alice's
+    assert repo.get_habit(ALICE, h.id).name == "No smoking"
+    repo.set_habit_day(ALICE, h.id, date(2026, 9, 2), True)
+    repo.set_habit_day(ALICE, h.id, date(2026, 9, 2), False)                  # answer changed
+    repo.set_habit_day(ALICE, h.id, date(2026, 9, 3), True)
+    repo.set_habit_day(ALICE, h.id, date(2026, 9, 3), None)                   # cleared
+    assert [(d.day, d.kept) for d in repo.habit_days(ALICE, date(2026, 9, 1))] == [(date(2026, 9, 2), False)]
+    with pytest.raises(KeyError):
+        repo.set_habit_day(BOB, h.id, date(2026, 9, 4), True)
+    repo.add_urge(ALICE, Urge(habit_id=h.id, at=datetime(2026, 9, 2, 16, 40, tzinfo=timezone.utc),
+                              local=datetime(2026, 9, 2, 22, 10)))
+    assert [u.local.hour for u in repo.list_urges(ALICE, date(2026, 9, 1))] == [22]
+    assert repo.list_urges(BOB, date(2026, 9, 1)) == []
+    assert repo.delete_habit(BOB, h.id) is False and repo.delete_habit(ALICE, h.id) is True
+    assert repo.habit_days(ALICE, date(2026, 9, 1)) == [] and repo.list_urges(ALICE, date(2026, 9, 1)) == []

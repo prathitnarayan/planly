@@ -225,10 +225,29 @@ export type RealityView = {
   };
 };
 
-export type NotifyPrefs = { morning: boolean; morning_at: string; evening: boolean; evening_at: string };
+export type NotifyPrefs = {
+  morning: boolean; morning_at: string; evening: boolean; evening_at: string;
+  quote: boolean; habit_nudge: boolean;
+};
 export type SettingsView = {
   timezone: string;
   notify: NotifyPrefs;
   telegram: { available: boolean; linked: boolean; username: string | null; bot: string | null };
   google: { available: boolean; connected: boolean; fetched_at: string | null; error: string | null; busy_hours_next_7d: number | null };
+};
+
+// ---- habits (008) ----
+export type Habit = {
+  id: string; name: string; kind: "quit" | "build"; why: string | null; label: string | null;
+  started: string; archived: boolean; nudge: boolean;
+};
+export type StripDay = { day: string; state: "kept" | "slip" | "blank" | "before" };
+export type HabitStats = {
+  current: number; best: number; previous_best: number; kept_window: number; window: number;
+  slips_window: number; total_kept: number; last_slip: string | null;
+  today: boolean | null; yesterday: boolean | null; strip: StripDay[];
+};
+export type HabitView = {
+  habit: Habit; stats: HabitStats; lines: string[];
+  risk_time: string | null; risk_day: string | null; urges_7d: number;
 };

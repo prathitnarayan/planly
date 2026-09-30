@@ -26,6 +26,7 @@ from app.planners.capacity import CapacityProfile
 from app.planners.progress import CheckIn
 from app.schemas.blueprint import GoalBlueprint
 from app.planners.integrity import Integrity, WatchEvidence, merge_intervals
+from app.planners.habits import Habit, HabitDay, Urge
 from app.planners.learning import Learned, Outcome
 from app.schemas.integrations import GoogleLink, NotifyPrefs, TelegramLink
 from app.schemas.source import CourseSource
@@ -99,6 +100,15 @@ class GoalRepo(Protocol):
     def user_by_chat(self, chat_id: int) -> str | None: ...
     def telegram_users(self) -> list[str]: ...
     def get_watch(self, user_id: str, keys: list[str]) -> dict[str, WatchEvidence]: ...
+    # habits (008)
+    def list_habits(self, user_id: str) -> list[Habit]: ...
+    def get_habit(self, user_id: str, habit_id: str) -> Habit | None: ...
+    def save_habit(self, user_id: str, habit: Habit) -> None: ...
+    def delete_habit(self, user_id: str, habit_id: str) -> bool: ...
+    def habit_days(self, user_id: str, since: date) -> list[HabitDay]: ...
+    def set_habit_day(self, user_id: str, habit_id: str, day: date, kept: bool | None) -> None: ...
+    def add_urge(self, user_id: str, urge: Urge) -> None: ...
+    def list_urges(self, user_id: str, since: date) -> list[Urge]: ...
 
 
 def _merged(old: WatchEvidence | None, ev: WatchEvidence) -> WatchEvidence:
@@ -130,6 +140,47 @@ class InMemoryRepo:
         self.watch: dict[tuple[str, str], WatchEvidence] = {}
         self.settings: dict[str, UserSettings] = {}
         self.outcomes: list[tuple[str, Outcome]] = []
+        self.habits: dict[tuple[str, str], Habit] = {}
+        self.days: dict[tuple[str, str, date], bool] = {}
+        self.urges: list[tuple[str, Urge]] = []
+
+    # ---- habits ----
+    def list_habits(self, user_id):
+        return [h.model_copy() for (u, _), h in self.habits.items() if u == user_id]
+
+    def get_habit(self, user_id, habit_id):
+        h = self.habits.get((user_id, habit_id))
+        return h.model_copy() if h else None
+
+    def save_habit(self, user_id, habit):
+        if any(hid == habit.id and u != user_id for u, hid in self.habits):
+            raise KeyError(habit.id)
+        self.habits[(user_id, habit.id)] = habit.model_copy()
+
+    def delete_habit(self, user_id, habit_id):
+        self.days = {k: v for k, v in self.days.items() if not (k[0] == user_id and k[1] == habit_id)}
+        self.urges = [(u, x) for u, x in self.urges if not (u == user_id and x.habit_id == habit_id)]
+        return self.habits.pop((user_id, habit_id), None) is not None
+
+    def habit_days(self, user_id, since):
+        return [HabitDay(habit_id=h, day=d, kept=k) for (u, h, d), k in self.days.items()
+                if u == user_id and d >= since]
+
+    def set_habit_day(self, user_id, habit_id, day, kept):
+        if (user_id, habit_id) not in self.habits:
+            raise KeyError(habit_id)
+        if kept is None:
+            self.days.pop((user_id, habit_id, day), None)
+        else:
+            self.days[(user_id, habit_id, day)] = kept
+
+    def add_urge(self, user_id, urge):
+        if (user_id, urge.habit_id) not in self.habits:
+            raise KeyError(urge.habit_id)
+        self.urges.append((user_id, urge.model_copy()))
+
+    def list_urges(self, user_id, since):
+        return [x.model_copy() for u, x in self.urges if u == user_id and x.local.date() >= since]
 
     def get_settings(self, user_id):
         return (self.settings.get(user_id) or UserSettings()).model_copy(deep=True)
@@ -458,6 +509,79 @@ class PostgresRepo:
                 (user_id, since),
             ).fetchall()
         return [Outcome.model_validate({**r[1], "goal_id": str(r[0]) if r[0] else None}) for r in rows]
+
+    # ---- habits ----
+    @staticmethod
+    def _habit(hid, data) -> Habit:
+        return Habit.model_validate({**data, "id": str(hid)})
+
+    def list_habits(self, user_id):
+        with self.pool.connection() as conn:
+            rows = conn.execute("select id, data from public.habits where user_id = %s order by created_at",
+                                (user_id,)).fetchall()
+        return [self._habit(r[0], r[1]) for r in rows]
+
+    def get_habit(self, user_id, habit_id):
+        if not _valid_uuid(habit_id):
+            return None
+        with self.pool.connection() as conn:
+            r = conn.execute("select id, data from public.habits where id = %s and user_id = %s",
+                             (habit_id, user_id)).fetchone()
+        return self._habit(r[0], r[1]) if r else None
+
+    def save_habit(self, user_id, habit):
+        from psycopg.types.json import Jsonb
+        data = Jsonb(habit.model_dump(mode="json", exclude={"id"}))
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """insert into public.habits (id, user_id, data) values (%s, %s, %s)
+                   on conflict (id) do update set data = excluded.data, updated_at = now()
+                   where public.habits.user_id = excluded.user_id""",
+                (habit.id, user_id, data))
+            if cur.rowcount != 1:
+                raise KeyError(habit.id)
+
+    def delete_habit(self, user_id, habit_id):
+        if not _valid_uuid(habit_id):
+            return False
+        with self.pool.connection() as conn:
+            cur = conn.execute("delete from public.habits where id = %s and user_id = %s", (habit_id, user_id))
+            return cur.rowcount == 1
+
+    def habit_days(self, user_id, since):
+        with self.pool.connection() as conn:
+            rows = conn.execute("select habit_id, day, kept from public.habit_days where user_id = %s and day >= %s",
+                                (user_id, since)).fetchall()
+        return [HabitDay(habit_id=str(r[0]), day=r[1], kept=r[2]) for r in rows]
+
+    def set_habit_day(self, user_id, habit_id, day, kept):
+        with self.pool.connection() as conn:
+            if not conn.execute("select 1 from public.habits where id = %s and user_id = %s",
+                                (habit_id, user_id)).fetchone():
+                raise KeyError(habit_id)
+            if kept is None:
+                conn.execute("delete from public.habit_days where habit_id = %s and user_id = %s and day = %s",
+                             (habit_id, user_id, day))
+            else:
+                conn.execute(
+                    """insert into public.habit_days (habit_id, user_id, day, kept) values (%s, %s, %s, %s)
+                       on conflict (habit_id, day) do update set kept = excluded.kept, updated_at = now()""",
+                    (habit_id, user_id, day, kept))
+
+    def add_urge(self, user_id, urge):
+        with self.pool.connection() as conn:
+            if not conn.execute("select 1 from public.habits where id = %s and user_id = %s",
+                                (urge.habit_id, user_id)).fetchone():
+                raise KeyError(urge.habit_id)
+            conn.execute("insert into public.urges (habit_id, user_id, at, local_at) values (%s, %s, %s, %s)",
+                         (urge.habit_id, user_id, urge.at, urge.local.replace(tzinfo=None)))
+
+    def list_urges(self, user_id, since):
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "select habit_id, at, local_at from public.urges where user_id = %s and local_at >= %s order by at",
+                (user_id, datetime.combine(since, datetime.min.time()))).fetchall()
+        return [Urge(habit_id=str(r[0]), at=r[1], local=r[2]) for r in rows]
 
     def close(self) -> None:
         self.pool.close()

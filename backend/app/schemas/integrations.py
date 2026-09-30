@@ -8,13 +8,16 @@ from pydantic import BaseModel, Field
 
 
 class NotifyPrefs(BaseModel):
-    """At most two messages a day, both optional."""
+    """Morning + evening (both optional), plus at most one habit heads-up a day (008)."""
     morning: bool = True
     morning_at: time = time(8, 0)
     evening: bool = True
     evening_at: time = time(21, 30)
+    quote: bool = True              # the day's quote at the top of the morning message, even with no goals
+    habit_nudge: bool = True        # heads-up 30 min before the user's usual urge time
     last_morning: date | None = None
     last_evening: date | None = None
+    last_nudge: date | None = None
 
 
 class TelegramLink(BaseModel):

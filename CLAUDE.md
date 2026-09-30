@@ -38,7 +38,9 @@ backend/app/
                          + video pace (real page time / video watched); recency-weighted, shrunk to defaults
   planners/reality.py    reality check: AI gives the commonly quoted prep range for WELL-KNOWN goals (UPSC, CAT,
                          marathon...); code compares with deadline + free time -> ok / tight / unrealistic (warn only)
-  planners/notify.py     when to message (morning/evening windows, once per local day) + message text/buttons
+  planners/notify.py     when to message (morning/evening windows, once per local day, habit nudge) + text/buttons
+  planners/habits.py     habit streaks (current / best / 30-day record, blanks skipped), risky time from the
+                         user's own urge log, risky weekday from their slips, personal lines, daily quote
   core/telegram.py       Bot API calls; webhook auto-registered (secret header). core/gcal.py: Google OAuth,
                          calendar.freebusy ONLY, refresh token encrypted with APP_SECRET, busy cached 30 min
   planners/pool.py       ONE pool of free time for all goals: goals plan in priority order, lower goals get the
@@ -66,9 +68,9 @@ extension/               Chrome MV3: per-site ON via optional_host_permissions (
                          background.js POSTs /sources/page and auto-re-syncs watched pages (<= every 6h)
 frontend/components/goal/Courses.tsx  "Your courses" panel: load per course, items by section, add by link
 backend/tests/           pytest; every planner function gets tests
-database/migrations/     001..006, run in order (002 dates, 003 sources, 004 ticks, 005 integrity + watch_evidence,
+database/migrations/     001..008, run in order (002 dates, 003 sources, 004 ticks, 005 integrity + watch_evidence,
                          006 user_settings (shared capacity, goal order, learned) + outcomes + watch_evidence.active_s,
-                         007 timezone + integrations + telegram lookups).
+                         007 timezone + integrations + telegram lookups, 008 habits + habit_days + urges).
                          001_planly.sql — goals (JSONB docs) + append-only checkins / estimate_corrections, RLS
 docs/SUPABASE_SETUP.md   step-by-step connection guide
 docs/normalized_schema_future.sql  NOT applied — future row-per-milestone design
@@ -167,7 +169,9 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
       interview.reality (no migration); card on the confirm step, and on the plan page when tight/unrealistic
 - [x] Telegram nudges + Google Calendar read-only (API 0.11.0, 007_integrations.sql, docs/INTEGRATIONS.md):
       /me/settings, /me/telegram/*, /telegram/webhook, /cron/notify (GitHub Actions every 15 min), /me/google/*
-- [ ] Bad-habit streaks ("days without X", evening yes/no on Telegram) + personal nudges from the user's own data
+- [x] Habit streaks + daily quote (API 0.12.0, 008_habits.sql): /habits CRUD, PUT /habits/{id}/days,
+      POST /habits/{id}/urges; Habits page; Telegram yes/no buttons, /urge, one heads-up a day at the
+      user's own risky time; quote at the top of every morning message, even with no goals
 - [ ] Learning stage 2 (crowd priors per course item) and 3 (model); long-haul mode (phases, rolling detail,
       revision cycles, books, mock scores, fixed daily blocks)
 - [ ] Codeforces/LeetCode solved via their APIs (stronger practice evidence); trust per user instead of per goal
@@ -184,13 +188,25 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
   before the plan starts, "Start today instead" (POST /start-today; only if nothing is logged yet).
 
 ## Notification + calendar rules
-- One channel (Telegram), at most two messages a day, each switchable: morning list; evening ONLY if something
-  is unticked. Sent once per LOCAL day inside a window (3h / 2h) so a late cron never sends a stale message.
+- One channel (Telegram), each switchable: morning (quote + list + habits); evening ONLY if a session is
+  unticked or a habit is unanswered; at most one habit heads-up. Sent once per LOCAL day inside a window (3h / 2h) so a late cron never sends a stale message.
 - Button data is a short token (Telegram's 64-byte limit) mapped to {goal, session, day} in the user's settings;
-  only the latest message's buttons are valid. Locked (evidence-only) sessions can't be ticked from chat.
+  buttons live for today + yesterday. Locked (evidence-only) sessions can't be ticked from chat.
 - Calendar is READ-ONLY free/busy: never titles, never writes events. Only the part of a meeting that overlaps a
   free slot is taken out (merged), before any goal plans. A failed fetch keeps the last busy times + shows an error.
 - No profiling users (age/"nature") for messages: personal = built from their own streaks and numbers.
+
+## Habit rules
+- Self-report only, so NO penalties, trust or locks. A slip resets the current streak; best streak and
+  "N of the last 30 days" stay. Blank days neither count nor break the streak.
+- Answers can be changed for the last 7 days (web) / today and yesterday (Telegram buttons), never before
+  the habit's start date or in the future. Max 10 active habits.
+- Nudge = at most one a day, only once >= 4 urges in 60 days put >= 3 (and >= 40%) in one 2-hour window;
+  30 min before that window, only for unanswered quit habits with nudge on. No pattern, no nudge.
+- Messages show `label` (lock-screen name) when set, never the real name. Personal lines only from the
+  user's own numbers + their own "why" line. Quotes: short, old / proverbs; same all day, cycles per user.
+- Telegram buttons now stay valid for today + yesterday (token has msg kind + made day), so the morning
+  buttons still work after the evening message. Button rows can hold 2 buttons (yes / no).
 
 ## Reality check rules
 - The model only says whether a goal is well-known and the usual range (hours + months), labelled an AI estimate.

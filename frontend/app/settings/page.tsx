@@ -78,7 +78,7 @@ export default function Settings() {
   return (
     <>
       <Link href="/" className="mb-6 inline-block text-sm text-muted hover:text-ink">← Goals</Link>
-      <PageTitle kicker="Settings" sub="Planly talks to you in one place, at most twice a day. Your calendar is only read, never written.">
+      <PageTitle kicker="Settings" sub="Planly talks to you in one place: a morning message, an evening check only if something is open, and at most one habit heads-up. Your calendar is only read, never written.">
         Nudges & calendar
       </PageTitle>
       {note && <p className="rise mb-6 rounded-lg border border-ink px-4 py-3 text-sm">{note}</p>}
@@ -98,7 +98,7 @@ export default function Settings() {
           <p className="text-sm text-muted">Not set up on this Planly server yet (see docs/INTEGRATIONS.md).</p>
         ) : !s.telegram.linked ? (
           <>
-            <p className="mb-3 text-sm">Get today&apos;s tasks in the morning and tick them from the chat. Nothing else.</p>
+            <p className="mb-3 text-sm">A quote and today&apos;s tasks every morning; tick tasks and answer habits from the chat.</p>
             <Button onClick={connectTelegram} disabled={busy === "tg"}>Connect Telegram</Button>
           </>
         ) : (
@@ -109,13 +109,25 @@ export default function Settings() {
                   <span className="flex items-center gap-3">
                     <input type="checkbox" checked={notify[k]} className="h-4 w-4 accent-current"
                            onChange={(e) => setNotify({ ...notify, [k]: e.target.checked })} />
-                    {k === "morning" ? "Morning: today's tasks" : "Evening: only if something's still open"}
+                    {k === "morning" ? "Morning: quote, tasks, habit streaks" : "Evening: only if something's still open"}
                   </span>
                   <input type="time" value={hhmm(notify[`${k}_at`])} disabled={!notify[k]}
                          onChange={(e) => setNotify({ ...notify, [`${k}_at`]: e.target.value })}
                          className="num h-9 rounded-md border border-line bg-paper px-2 text-sm disabled:opacity-40" />
                 </label>
               ))}
+              <label className="flex items-center gap-3 text-sm">
+                <input type="checkbox" checked={notify.quote} disabled={!notify.morning} className="h-4 w-4 accent-current"
+                       onChange={(e) => setNotify({ ...notify, quote: e.target.checked })} />
+                Daily quote at the top of the morning message
+                <span className="text-xs text-muted">(the line you see on the lock screen)</span>
+              </label>
+              <label className="flex items-center gap-3 text-sm">
+                <input type="checkbox" checked={notify.habit_nudge} className="h-4 w-4 accent-current"
+                       onChange={(e) => setNotify({ ...notify, habit_nudge: e.target.checked })} />
+                Habit heads-up, 30 min before your usual urge time
+                <span className="text-xs text-muted">(max once a day)</span>
+              </label>
             </div>
             <div className="mt-4 flex flex-wrap gap-2">
               <Button disabled={busy === "save"} onClick={() => run("save", () => api("/me/settings", { method: "PUT", body: { notify } }))}>Save</Button>

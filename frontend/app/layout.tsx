@@ -19,6 +19,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
               planly<span className="text-muted">.</span>
             </Link>
             <span className="flex items-center gap-4">
+              <Link href="/habits" className="text-xs text-muted hover:text-ink hover:underline underline-offset-4">Habits</Link>
               <Link href="/settings" className="text-xs text-muted hover:text-ink hover:underline underline-offset-4">Settings</Link>
               <SignOut />
             </span>

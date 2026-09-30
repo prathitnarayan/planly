@@ -43,6 +43,8 @@ from app.core.estimate_log import make_row
 from app.core.repo import (
     DatabaseUnavailable, GoalRecord, GoalRepo, GoalSummary, InMemoryRepo, PostgresRepo, UserSettings,
 )
+from app.planners import habits as habit_logic
+from app.planners.habits import Habit, HabitStats, Urge
 from app.planners.learning import Learned, learn
 from app.planners import notify as notify_logic
 from app.planners.pool import busy_taken, shared_pool_taken
@@ -63,7 +65,7 @@ from app.schemas.interview import GoalCheck, GoalProfile, RealityCheck
 from app.schemas.integrations import GoogleLink, NotifyPrefs, TelegramLink
 from app.schemas.source import CourseSource, SourceItem, parse_duration
 
-app = FastAPI(title="Planly API", version="0.11.0")
+app = FastAPI(title="Planly API", version="0.12.0")
 
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
@@ -927,7 +929,8 @@ def put_settings(body: SettingsIn, ctx: Ctx = Depends()) -> SettingsView:
     if body.notify:
         keep = ctx.settings.notify          # don't let the client reset "already sent today"
         ctx.settings.notify = body.notify.model_copy(update={"last_morning": keep.last_morning,
-                                                             "last_evening": keep.last_evening})
+                                                             "last_evening": keep.last_evening,
+                                                             "last_nudge": keep.last_nudge})
     ctx.save_settings()
     return _settings_view(ctx)
 
@@ -975,28 +978,224 @@ def _goals_today(ctx: "Ctx", day: date) -> list[tuple[str, str, "TodayView"]]:
     return out
 
 
+# ---- habits (008): streaks, the user's own risky times, daily quote ----
+
+class HabitView(BaseModel):
+    habit: Habit
+    stats: HabitStats
+    lines: list[str]                  # personal lines, from their own numbers
+    risk_time: str | None             # "22:00–00:00" once their urge log shows a pattern
+    risk_day: str | None              # "Friday (3 of your last 4 slips)"
+    urges_7d: int
+
+
+def _habit_views(ctx: "Ctx", today: date, archived: bool = True) -> list[HabitView]:
+    hs = [h for h in ctx.repo.list_habits(ctx.user_id) if archived or not h.archived]
+    if not hs:
+        return []
+    days: dict[str, dict[date, bool]] = {}
+    for d in ctx.repo.habit_days(ctx.user_id, min(h.started for h in hs)):
+        days.setdefault(d.habit_id, {})[d.day] = d.kept
+    urges = ctx.repo.list_urges(ctx.user_id, today - timedelta(days=habit_logic.URGE_LOOKBACK_DAYS))
+    out = []
+    for h in hs:
+        mine = days.get(h.id, {})
+        st = habit_logic.stats(h, mine, today)
+        rday = habit_logic.risk_day(mine, today)
+        hu = [u for u in urges if u.habit_id == h.id]
+        rt = habit_logic.risk_time(hu, today)
+        out.append(HabitView(
+            habit=h, stats=st, lines=habit_logic.lines(h, st, today, rday),
+            risk_time=rt.label if rt else None,
+            risk_day=f"{rday.name} ({rday.slips} of your last {rday.total} slips)" if rday else None,
+            urges_7d=sum(1 for u in hu if u.local.date() > today - timedelta(days=7))))
+    return sorted(out, key=lambda v: v.habit.archived)
+
+
+def _briefs(views: list[HabitView]) -> list[notify_logic.HabitBrief]:
+    return [notify_logic.HabitBrief(habit=v.habit, stats=v.stats, lines=v.lines)
+            for v in views if not v.habit.archived]
+
+
+def _load_habit(ctx: "Ctx", habit_id: str) -> Habit:
+    h = ctx.repo.get_habit(ctx.user_id, habit_id)
+    if not h:
+        raise HTTPException(status_code=404, detail="habit not found")
+    return h
+
+
+def _one_view(ctx: "Ctx", habit_id: str, today: date) -> HabitView:
+    return next(v for v in _habit_views(ctx, today) if v.habit.id == habit_id)
+
+
+@app.get("/habits", response_model=list[HabitView])
+def list_habits(today: date | None = None, ctx: Ctx = Depends()) -> list[HabitView]:
+    return _habit_views(ctx, _user_today(today))
+
+
+class HabitIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    kind: habit_logic.Kind = "quit"
+    why: str | None = Field(default=None, max_length=200)
+    label: str | None = Field(default=None, max_length=30)
+    started: date | None = None
+    today: date | None = None
+
+
+@app.post("/habits", response_model=HabitView)
+def create_habit(body: HabitIn, ctx: Ctx = Depends()) -> HabitView:
+    today = _user_today(body.today)
+    if sum(1 for h in ctx.repo.list_habits(ctx.user_id) if not h.archived) >= habit_logic.MAX_HABITS:
+        raise HTTPException(status_code=409, detail=f"{habit_logic.MAX_HABITS} habits at once is the limit — archive one first.")
+    started = body.started or today
+    if started > today or started < today - timedelta(days=365):
+        raise HTTPException(status_code=422, detail="start date must be within the last year, not in the future")
+    h = Habit(name=body.name, kind=body.kind, why=body.why, label=body.label, started=started)
+    ctx.repo.save_habit(ctx.user_id, h)
+    return _one_view(ctx, h.id, today)
+
+
+class HabitPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    why: str | None = Field(default=None, max_length=200)
+    label: str | None = Field(default=None, max_length=30)
+    archived: bool | None = None
+    nudge: bool | None = None
+    today: date | None = None
+
+
+@app.patch("/habits/{habit_id}", response_model=HabitView)
+def edit_habit(habit_id: str, body: HabitPatch, ctx: Ctx = Depends()) -> HabitView:
+    h = _load_habit(ctx, habit_id)
+    changes = {k: getattr(body, k) for k in body.model_fields_set if k != "today"}
+    if "name" in changes and not changes["name"]:
+        raise HTTPException(status_code=422, detail="name can't be empty")
+    for k in ("archived", "nudge"):
+        if k in changes and changes[k] is None:
+            changes.pop(k)
+    h = Habit.model_validate({**h.model_dump(), **changes})      # why/label may be cleared with null
+    ctx.repo.save_habit(ctx.user_id, h)
+    return _one_view(ctx, h.id, _user_today(body.today))
+
+
+@app.delete("/habits/{habit_id}")
+def delete_habit(habit_id: str, ctx: Ctx = Depends()) -> dict:
+    if not ctx.repo.delete_habit(ctx.user_id, habit_id):
+        raise HTTPException(status_code=404, detail="habit not found")
+    return {"deleted": habit_id}
+
+
+class HabitDayIn(BaseModel):
+    day: date
+    kept: bool | None                 # null clears the answer
+    today: date | None = None
+
+
+HABIT_BACKFILL_DAYS = 7
+
+
+def _set_day(ctx: "Ctx", h: Habit, day: date, kept: bool | None, today: date) -> None:
+    if day > today:
+        raise HTTPException(status_code=422, detail="can't answer for a day that hasn't happened")
+    if day < h.started:
+        raise HTTPException(status_code=422, detail="that's before this habit started")
+    if day < today - timedelta(days=HABIT_BACKFILL_DAYS):
+        raise HTTPException(status_code=422, detail=f"only the last {HABIT_BACKFILL_DAYS} days can be changed")
+    ctx.repo.set_habit_day(ctx.user_id, h.id, day, kept)
+
+
+@app.put("/habits/{habit_id}/days", response_model=HabitView)
+def set_habit_day(habit_id: str, body: HabitDayIn, ctx: Ctx = Depends()) -> HabitView:
+    today = _user_today(body.today)
+    h = _load_habit(ctx, habit_id)
+    _set_day(ctx, h, body.day, body.kept, today)
+    return _one_view(ctx, h.id, today)
+
+
+class UrgeOut(BaseModel):
+    reply: str
+    view: HabitView
+
+
+def _log_urge(ctx: "Ctx", h: Habit) -> str:
+    now_utc = datetime.now(timezone.utc)
+    local = notify_logic.local_now(now_utc, ctx.settings.timezone)
+    ctx.repo.add_urge(ctx.user_id, Urge(habit_id=h.id, at=now_utc, local=local.replace(tzinfo=None)))
+    v = _one_view(ctx, h.id, local.date())
+    today_n = sum(1 for u in ctx.repo.list_urges(ctx.user_id, local.date()) if u.habit_id == h.id)
+    return habit_logic.urge_reply(h, v.stats, today_n)
+
+
+@app.post("/habits/{habit_id}/urges", response_model=UrgeOut)
+def log_urge(habit_id: str, ctx: Ctx = Depends()) -> UrgeOut:
+    h = _load_habit(ctx, habit_id)
+    reply = _log_urge(ctx, h)
+    return UrgeOut(reply=reply, view=_one_view(ctx, h.id, _local_today(ctx)))
+
+
+# ---- Telegram messages ----
+
+def _render(ctx: "Ctx", kind: str, day: date) -> tuple[str | None, list]:
+    """The morning / evening message as it stands right now (also used to refresh after a tap)."""
+    quote = habit_logic.quote_for(ctx.user_id, day) if kind == "morning" and ctx.settings.notify.quote else None
+    return notify_logic.build_message(kind, day, _goals_today(ctx, day), _briefs(_habit_views(ctx, day)), quote)
+
+
+def _tokens(ctx: "Ctx", rows: list, kind: str, day: date) -> list[list[tuple[str, str]]]:
+    """Swap button data for short tokens (Telegram allows 64 bytes). Buttons stay valid for today and
+    yesterday, so tapping the morning message still works after the evening one arrives."""
+    keep = {t: d for t, d in ctx.settings.telegram.buttons.items()
+            if d.get("made", "") >= (day - timedelta(days=1)).isoformat()}
+    out = []
+    for row in rows:
+        line = []
+        for label, data in row:
+            tok = notify_logic.new_token()
+            keep[tok] = {**data, "msg": kind, "made": day.isoformat()}
+            line.append((label, f"t:{tok}"))
+        out.append(line)
+    ctx.settings.telegram.buttons = keep
+    return out
+
+
 def _send_digest(ctx: "Ctx", kind: str, force: bool = False) -> bool:
-    """Morning list or evening check to the user's Telegram. Returns True if something was sent."""
+    """Morning (quote + list) or evening check to the user's Telegram. Returns True if something was sent."""
     chat = ctx.settings.telegram.chat_id
     if not chat:
         return False
     day = _local_today(ctx)
-    text, buttons = notify_logic.build_message(kind, day, _goals_today(ctx, day))
+    text, rows = _render(ctx, kind, day)
     if text is None:
         if not force:
             return False
-        text, buttons = ("<b>Nothing planned today.</b> Enjoy it." if kind == "morning"
-                         else "<b>All done for today.</b> ✓"), []
-    tokens = {}
-    rows = []
-    for label, data in buttons:
-        tok = notify_logic.new_token()
-        tokens[tok] = data
-        rows.append((label, f"t:{tok}"))
-    ctx.settings.telegram.buttons = tokens      # only the latest message's buttons stay valid
-    telegram.send(chat, text, rows)
+        text, rows = ("<b>Nothing planned today.</b> Enjoy it." if kind == "morning"
+                      else "<b>All done for today.</b> ✓"), []
+    telegram.send(chat, text, _tokens(ctx, rows, kind, day))
     ctx.save_settings()
     return True
+
+
+def _send_nudge(ctx: "Ctx", now_utc: datetime) -> bool:
+    """At most one heads-up a day: 30 min before the user's OWN usual urge time, only for habits
+    not answered yet today. No pattern in their log = no nudge."""
+    prefs = ctx.settings.notify
+    if not (prefs.habit_nudge and ctx.settings.telegram.chat_id):
+        return False
+    local = notify_logic.local_now(now_utc, ctx.settings.timezone)
+    views = [v for v in _habit_views(ctx, local.date(), archived=False)
+             if v.habit.nudge and v.habit.kind == "quit" and v.stats.today is None]
+    if not views:
+        return False
+    urges = ctx.repo.list_urges(ctx.user_id, local.date() - timedelta(days=habit_logic.URGE_LOOKBACK_DAYS))
+    for v in views:
+        rt = habit_logic.risk_time([u for u in urges if u.habit_id == v.habit.id], local.date())
+        if rt and notify_logic.nudge_due(local, rt, prefs.last_nudge):
+            text, rows = notify_logic.build_nudge(_briefs([v])[0], rt)
+            telegram.send(ctx.settings.telegram.chat_id, text, _tokens(ctx, rows, "nudge", local.date()))
+            prefs.last_nudge = local.date()
+            ctx.save_settings()
+            return True
+    return False
 
 
 @app.post("/me/telegram/test")
@@ -1024,46 +1223,77 @@ async def telegram_webhook(request: Request, repo: GoalRepo = Depends(get_repo))
     return {"ok": True}
 
 
-HELP = ("<b>planly.</b>\n/today — today's tasks with tick buttons\n/stop — disconnect this chat\n"
-        "Morning and evening messages can be changed in Planly → Settings.")
+HELP = ("<b>planly.</b>\n/today — today's quote, tasks and habits\n/urge — log a craving right now\n"
+        "/stop — disconnect this chat\nMessage times can be changed in Planly → Settings.")
+
+
+def _refresh(ctx: "Ctx", chat: int, message_id: int, kind: str, day: date) -> None:
+    """Redraw the message the button was on, so it shows the new state."""
+    if kind == "nudge":
+        return
+    text, rows = _render(ctx, "morning" if kind == "morning" else "evening", day)
+    if text is None:
+        text, rows = "<b>All done for today.</b> ✓", []
+    telegram.edit(chat, message_id, text, _tokens(ctx, rows, kind, day))
+    ctx.save_settings()
+
+
+def _handle_callback(cq: dict, repo: GoalRepo) -> None:
+    chat = cq.get("message", {}).get("chat", {}).get("id")
+    uid = repo.user_by_chat(chat) if chat else None
+    if not uid:
+        return telegram.answer(cq["id"], "This chat isn't linked to Planly.")
+    ctx = Ctx(user_id=uid, repo=repo)
+    data = ctx.settings.telegram.buttons.get((cq.get("data") or "")[2:])
+    if not data:
+        return telegram.answer(cq["id"], "That button is old — send /today for a fresh list.")
+    today = _local_today(ctx)
+    msg_id = cq.get("message", {}).get("message_id")
+    kind = data.get("msg", "morning")
+
+    if data.get("t") == "u":                                   # urge
+        h = repo.get_habit(uid, data["habit_id"])
+        if not h:
+            return telegram.answer(cq["id"], "That habit was removed.")
+        telegram.answer(cq["id"], "Logged")
+        return telegram.send(chat, _log_urge(ctx, h))
+
+    if data.get("t") == "h":                                   # habit yes / no
+        h = repo.get_habit(uid, data["habit_id"])
+        day = date.fromisoformat(data["day"])
+        if not h:
+            return telegram.answer(cq["id"], "That habit was removed.")
+        if day < today - timedelta(days=1):
+            return telegram.answer(cq["id"], "Too old for chat — change it on the Habits page.")
+        try:
+            _set_day(ctx, h, day, data["kept"], today)
+        except HTTPException as e:
+            return telegram.answer(cq["id"], str(e.detail)[:190])
+        telegram.answer(cq["id"], ("Kept ✓" if data["kept"] else "Noted. Tomorrow counts the same."))
+        if msg_id:
+            _refresh(ctx, chat, msg_id, kind, today)
+        return
+
+    if data.get("locked"):                                     # study session tick
+        return telegram.answer(cq["id"], "Evidence only: watch it (Planly extension) and it ticks itself.")
+    rec = repo.get(uid, data["goal_id"])
+    day = date.fromisoformat(data["day"])
+    if not rec or day != today:
+        return telegram.answer(cq["id"], "That day is over — send /today.")
+    current = set(rec.ticks.days.get(day.isoformat(), []))
+    done = data["session_id"] not in current
+    try:
+        _apply_tick(ctx, rec, day, data["session_id"], done)
+    except HTTPException as e:
+        return telegram.answer(cq["id"], str(e.detail)[:190])
+    telegram.answer(cq["id"], "Ticked ✓" if done else "Unticked")
+    if msg_id:
+        _refresh(ctx, chat, msg_id, "morning", day)
 
 
 def _handle_update(update: dict, repo: GoalRepo) -> None:
     if "callback_query" in update:
-        cq = update["callback_query"]
-        chat = cq.get("message", {}).get("chat", {}).get("id")
-        uid = repo.user_by_chat(chat) if chat else None
-        if not uid:
-            return telegram.answer(cq["id"], "This chat isn't linked to Planly.")
-        ctx = Ctx(user_id=uid, repo=repo)
-        data = ctx.settings.telegram.buttons.get((cq.get("data") or "")[2:])
-        if not data:
-            return telegram.answer(cq["id"], "That button is old — send /today for a fresh list.")
-        if data.get("locked"):
-            return telegram.answer(cq["id"], "Evidence only: watch it (Planly extension) and it ticks itself.")
-        rec = repo.get(uid, data["goal_id"])
-        day = date.fromisoformat(data["day"])
-        if not rec or day != _local_today(ctx):
-            return telegram.answer(cq["id"], "That day is over — send /today.")
-        current = set(rec.ticks.days.get(day.isoformat(), []))
-        done = data["session_id"] not in current
-        try:
-            _apply_tick(ctx, rec, day, data["session_id"], done)
-        except HTTPException as e:
-            return telegram.answer(cq["id"], str(e.detail)[:190])
-        telegram.answer(cq["id"], "Ticked ✓" if done else "Unticked")
-        # refresh the message so the buttons show the new state
-        text, buttons = notify_logic.build_message("morning", day, _goals_today(ctx, day))
-        if text:
-            tokens, rows = {}, []
-            for label, d in buttons:
-                tok = notify_logic.new_token()
-                tokens[tok] = d
-                rows.append((label, f"t:{tok}"))
-            ctx.settings.telegram.buttons = tokens
-            ctx.save_settings()
-            telegram.edit(chat, cq["message"]["message_id"], text, rows)
-        return
+        return _handle_callback(update["callback_query"], repo)
 
     msg = update.get("message") or {}
     chat = msg.get("chat", {}).get("id")
@@ -1085,14 +1315,26 @@ def _handle_update(update: dict, repo: GoalRepo) -> None:
         tg.chat_id, tg.link_code, tg.link_expires = chat, None, None
         tg.username = (msg.get("from") or {}).get("username")
         ctx.save_settings()
-        return telegram.send(chat, "✓ Linked to Planly. You'll get today's tasks in the morning and one "
-                                   "check in the evening (change or turn off in Settings).\n\n" + HELP)
+        return telegram.send(chat, "✓ Linked to Planly. Every morning: a quote, today's tasks and your habit "
+                                   "streaks. In the evening: one check, only if something's open "
+                                   "(change or turn off in Settings).\n\n" + HELP)
     uid = repo.user_by_chat(chat)
     if not uid:
         return telegram.send(chat, "This chat isn't linked yet. Planly → Settings → Connect Telegram.")
     ctx = Ctx(user_id=uid, repo=repo)
     if text.startswith("/today"):
         _send_digest(ctx, "morning", force=True)
+    elif text.startswith("/urge"):
+        hs = [h for h in repo.list_habits(uid) if not h.archived and h.kind == "quit"]
+        if not hs:
+            telegram.send(chat, "No habit to quit yet — add one in Planly → Habits.")
+        elif len(hs) == 1:
+            telegram.send(chat, _log_urge(ctx, hs[0]))
+        else:
+            day = _local_today(ctx)
+            rows = [[(f"🔥 {h.shown}"[:60], {"t": "u", "habit_id": h.id})] for h in hs]
+            telegram.send(chat, "Which one?", _tokens(ctx, rows, "nudge", day))
+            ctx.save_settings()
     elif text.startswith("/stop"):
         ctx.settings.telegram = TelegramLink()
         ctx.save_settings()
@@ -1103,8 +1345,9 @@ def _handle_update(update: dict, repo: GoalRepo) -> None:
 
 @app.post("/cron/notify")
 def cron_notify(request: Request, repo: GoalRepo = Depends(get_repo)) -> dict:
-    """Called every ~15 min (GitHub Actions / cron-job.org). Sends each user's morning list and
-    evening check once, in their own timezone. Also keeps the free Render instance awake."""
+    """Called every ~15 min (GitHub Actions / cron-job.org). Sends each user's morning message and
+    evening check once, in their own timezone, plus at most one habit heads-up a day.
+    Also keeps the free Render instance awake."""
     if not config.CRON_SECRET or request.headers.get("X-Cron-Secret") != config.CRON_SECRET:
         raise HTTPException(status_code=403, detail="forbidden")
     try:
@@ -1123,6 +1366,11 @@ def cron_notify(request: Request, repo: GoalRepo = Depends(get_repo)) -> dict:
                 continue
             setattr(ctx.settings.notify, f"last_{kind}", day)     # once a day, sent or nothing to say
             ctx.save_settings()
+        try:
+            if _send_nudge(ctx, now_):
+                sent.append("nudge")
+        except telegram.TelegramError:
+            pass
     return {"sent": len(sent)}
 
 
