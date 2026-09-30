@@ -359,3 +359,18 @@ def test_watch_active_time_adds_up(repo):
     repo.merge_watch(ALICE, [WatchEvidence(key=k, duration_s=600, intervals=[(0, 60)], active_s=90)])
     got = repo.merge_watch(ALICE, [WatchEvidence(key=k, duration_s=600, intervals=[(60, 120)], active_s=100)])
     assert got[k].active_s == 190
+
+
+def test_telegram_lookups_and_integrations_roundtrip(repo):
+    from app.core.repo import UserSettings
+    st = UserSettings(timezone="Europe/London")
+    st.telegram.link_code = "abc123"
+    repo.save_settings(ALICE, st)
+    assert repo.user_by_link_code("abc123") == ALICE and repo.user_by_link_code("nope") is None
+    st = repo.get_settings(ALICE)
+    st.telegram.chat_id, st.telegram.link_code = 4242, None
+    st.google.refresh_token_enc = "enc"
+    repo.save_settings(ALICE, st)
+    assert repo.user_by_chat(4242) == ALICE and ALICE in repo.telegram_users()
+    got = repo.get_settings(ALICE)
+    assert got.timezone == "Europe/London" and got.google.connected and got.telegram.link_code is None

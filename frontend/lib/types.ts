@@ -224,3 +224,11 @@ export type RealityView = {
     share_of_minimum: number | null; earliest_realistic: string | null;
   };
 };
+
+export type NotifyPrefs = { morning: boolean; morning_at: string; evening: boolean; evening_at: string };
+export type SettingsView = {
+  timezone: string;
+  notify: NotifyPrefs;
+  telegram: { available: boolean; linked: boolean; username: string | null; bot: string | null };
+  google: { available: boolean; connected: boolean; fetched_at: string | null; error: string | null; busy_hours_next_7d: number | null };
+};

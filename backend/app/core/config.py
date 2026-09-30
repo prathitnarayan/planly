@@ -46,3 +46,20 @@ PLANLY_API_URL = os.getenv("PLANLY_API_URL", "http://localhost:8000").rstrip("/"
 # Optional: exact YouTube durations for playlists pasted in the app and videos embedded in
 # course pages. Free key: Google Cloud Console -> YouTube Data API v3 -> Credentials.
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+
+# ---------- integrations (all optional; features hide themselves when unset) ----------
+# Where this API is reachable from the internet, e.g. https://planly-u3y3.onrender.com
+PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "").rstrip("/")
+# Where the web app lives (Google sign-in returns there). Default: first FRONTEND_ORIGINS entry.
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/") or (FRONTEND_ORIGINS[0] if FRONTEND_ORIGINS else "")
+# Signs short-lived OAuth state and encrypts stored Google tokens. Any long random string.
+APP_SECRET = os.getenv("APP_SECRET", "")
+# Protects POST /cron/notify (called every 15 min by GitHub Actions / cron-job.org).
+CRON_SECRET = os.getenv("CRON_SECRET", "")
+# Telegram bot from @BotFather
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "").lstrip("@")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+# Google Calendar, read-only free/busy (Google Cloud Console -> OAuth client, type "Web application")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")

@@ -27,6 +27,7 @@ from app.planners.progress import CheckIn
 from app.schemas.blueprint import GoalBlueprint
 from app.planners.integrity import Integrity, WatchEvidence, merge_intervals
 from app.planners.learning import Learned, Outcome
+from app.schemas.integrations import GoogleLink, NotifyPrefs, TelegramLink
 from app.schemas.source import CourseSource
 
 
@@ -57,10 +58,18 @@ class GoalRecord(BaseModel):
 
 
 class UserSettings(BaseModel):
-    """Per user, across all goals (006)."""
+    """Per user, across all goals (006, 007)."""
     capacity: CapacityProfile | None = None     # ONE pool of free time shared by every goal
     goal_order: list[str] = Field(default_factory=list)   # priority: first goal plans first
     learned: Learned = Field(default_factory=Learned)     # how this user really works (learning.py)
+    timezone: str = "Asia/Kolkata"
+    notify: NotifyPrefs = Field(default_factory=NotifyPrefs)
+    telegram: TelegramLink = Field(default_factory=TelegramLink)
+    google: GoogleLink = Field(default_factory=GoogleLink)
+
+    def integrations(self) -> dict:
+        return {"notify": self.notify.model_dump(mode="json"), "telegram": self.telegram.model_dump(mode="json"),
+                "google": self.google.model_dump(mode="json")}
 
 
 class GoalSummary(BaseModel):
@@ -86,6 +95,9 @@ class GoalRepo(Protocol):
     def save_settings(self, user_id: str, settings: UserSettings) -> None: ...
     def add_outcomes(self, user_id: str, goal_id: str, rows: list[Outcome]) -> None: ...
     def list_outcomes(self, user_id: str, since: date) -> list[Outcome]: ...
+    def user_by_link_code(self, code: str) -> str | None: ...
+    def user_by_chat(self, chat_id: int) -> str | None: ...
+    def telegram_users(self) -> list[str]: ...
     def get_watch(self, user_id: str, keys: list[str]) -> dict[str, WatchEvidence]: ...
 
 
@@ -124,6 +136,15 @@ class InMemoryRepo:
 
     def save_settings(self, user_id, settings):
         self.settings[user_id] = settings.model_copy(deep=True)
+
+    def user_by_link_code(self, code):
+        return next((u for u, st in self.settings.items() if code and st.telegram.link_code == code), None)
+
+    def user_by_chat(self, chat_id):
+        return next((u for u, st in self.settings.items() if st.telegram.chat_id == chat_id), None)
+
+    def telegram_users(self):
+        return [u for u, st in self.settings.items() if st.telegram.chat_id]
 
     def add_outcomes(self, user_id, goal_id, rows):
         self.outcomes += [(user_id, r.model_copy(update={"goal_id": goal_id})) for r in rows]
@@ -376,23 +397,50 @@ class PostgresRepo:
 
     def get_settings(self, user_id):
         with self.pool.connection() as conn:
-            row = conn.execute("select capacity, goal_order, learned from public.user_settings where user_id = %s",
-                               (user_id,)).fetchone()
+            row = conn.execute(
+                """select capacity, goal_order, learned, timezone, integrations
+                   from public.user_settings where user_id = %s""", (user_id,)).fetchone()
         if not row:
             return UserSettings()
+        extra = row[4] or {}
         return UserSettings(capacity=CapacityProfile.model_validate(row[0]) if row[0] else None,
-                            goal_order=row[1] or [], learned=Learned.model_validate(row[2] or {}))
+                            goal_order=row[1] or [], learned=Learned.model_validate(row[2] or {}),
+                            timezone=row[3] or "Asia/Kolkata",
+                            notify=NotifyPrefs.model_validate(extra.get("notify") or {}),
+                            telegram=TelegramLink.model_validate(extra.get("telegram") or {}),
+                            google=GoogleLink.model_validate(extra.get("google") or {}))
 
     def save_settings(self, user_id, settings):
         from psycopg.types.json import Jsonb
         with self.pool.connection() as conn:
             conn.execute(
-                """insert into public.user_settings (user_id, capacity, goal_order, learned, updated_at)
-                   values (%s, %s, %s, %s, now())
+                """insert into public.user_settings (user_id, capacity, goal_order, learned, timezone, integrations,
+                                                    telegram_chat_id, link_code, updated_at)
+                   values (%s, %s, %s, %s, %s, %s, %s, %s, now())
                    on conflict (user_id) do update set capacity = excluded.capacity,
-                     goal_order = excluded.goal_order, learned = excluded.learned, updated_at = now()""",
-                (user_id, self._json(settings.capacity), Jsonb(settings.goal_order), self._json(settings.learned)),
+                     goal_order = excluded.goal_order, learned = excluded.learned, timezone = excluded.timezone,
+                     integrations = excluded.integrations, telegram_chat_id = excluded.telegram_chat_id,
+                     link_code = excluded.link_code, updated_at = now()""",
+                (user_id, self._json(settings.capacity), Jsonb(settings.goal_order), self._json(settings.learned),
+                 settings.timezone, Jsonb(settings.integrations()), settings.telegram.chat_id,
+                 settings.telegram.link_code),
             )
+
+    def user_by_link_code(self, code):
+        with self.pool.connection() as conn:
+            row = conn.execute("select user_id from public.user_settings where link_code = %s", (code,)).fetchone()
+        return str(row[0]) if row else None
+
+    def user_by_chat(self, chat_id):
+        with self.pool.connection() as conn:
+            row = conn.execute("select user_id from public.user_settings where telegram_chat_id = %s",
+                               (chat_id,)).fetchone()
+        return str(row[0]) if row else None
+
+    def telegram_users(self):
+        with self.pool.connection() as conn:
+            rows = conn.execute("select user_id from public.user_settings where telegram_chat_id is not null").fetchall()
+        return [str(r[0]) for r in rows]
 
     def add_outcomes(self, user_id, goal_id, rows):
         if not rows:

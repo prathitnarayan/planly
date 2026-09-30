@@ -25,3 +25,6 @@ Full setup: `docs/SUPABASE_SETUP.md`.
 ## Course sync
 Chrome extension (`extension/README.md`) for logged-in course sites, "Add by link" on the
 goal page for YouTube / public pages, or the terminal tool. See `docs/COURSE_SYNC.md`.
+
+## Telegram nudges + Google Calendar
+Optional. Setup: `docs/INTEGRATIONS.md` (bot token, Google OAuth client, the 15-minute GitHub Actions timer).

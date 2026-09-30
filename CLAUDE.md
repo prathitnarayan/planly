@@ -38,6 +38,9 @@ backend/app/
                          + video pace (real page time / video watched); recency-weighted, shrunk to defaults
   planners/reality.py    reality check: AI gives the commonly quoted prep range for WELL-KNOWN goals (UPSC, CAT,
                          marathon...); code compares with deadline + free time -> ok / tight / unrealistic (warn only)
+  planners/notify.py     when to message (morning/evening windows, once per local day) + message text/buttons
+  core/telegram.py       Bot API calls; webhook auto-registered (secret header). core/gcal.py: Google OAuth,
+                         calendar.freebusy ONLY, refresh token encrypted with APP_SECRET, busy cached 30 min
   planners/pool.py       ONE pool of free time for all goals: goals plan in priority order, lower goals get the
                          leftover time (exact times cut out of their slots via CapacityProfile.taken)
   core/plan_file.py      TEMP: one saved plan in data/plan.json for the terminal scripts
@@ -64,7 +67,8 @@ extension/               Chrome MV3: per-site ON via optional_host_permissions (
 frontend/components/goal/Courses.tsx  "Your courses" panel: load per course, items by section, add by link
 backend/tests/           pytest; every planner function gets tests
 database/migrations/     001..006, run in order (002 dates, 003 sources, 004 ticks, 005 integrity + watch_evidence,
-                         006 user_settings (shared capacity, goal order, learned) + outcomes + watch_evidence.active_s).
+                         006 user_settings (shared capacity, goal order, learned) + outcomes + watch_evidence.active_s,
+                         007 timezone + integrations + telegram lookups).
                          001_planly.sql — goals (JSONB docs) + append-only checkins / estimate_corrections, RLS
 docs/SUPABASE_SETUP.md   step-by-step connection guide
 docs/normalized_schema_future.sql  NOT applied — future row-per-milestone design
@@ -161,6 +165,9 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
       nightly from outcomes and used in planning; goals share one capacity in priority order (/me/goal-order)
 - [x] Reality check (API 0.10.0): GET /goals/{id}/reality, asked once per goal (reset on correction), stored in
       interview.reality (no migration); card on the confirm step, and on the plan page when tight/unrealistic
+- [x] Telegram nudges + Google Calendar read-only (API 0.11.0, 007_integrations.sql, docs/INTEGRATIONS.md):
+      /me/settings, /me/telegram/*, /telegram/webhook, /cron/notify (GitHub Actions every 15 min), /me/google/*
+- [ ] Bad-habit streaks ("days without X", evening yes/no on Telegram) + personal nudges from the user's own data
 - [ ] Learning stage 2 (crowd priors per course item) and 3 (model); long-haul mode (phases, rolling detail,
       revision cycles, books, mock scores, fixed daily blocks)
 - [ ] Codeforces/LeetCode solved via their APIs (stronger practice evidence); trust per user instead of per goal
@@ -175,6 +182,15 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
 - Frontend calls /today BEFORE /replan (sequentially) so a day is closed exactly once.
 - A day with nothing to tick (plan starts later / free day) shows "Next up" (preview, hatched boxes) and,
   before the plan starts, "Start today instead" (POST /start-today; only if nothing is logged yet).
+
+## Notification + calendar rules
+- One channel (Telegram), at most two messages a day, each switchable: morning list; evening ONLY if something
+  is unticked. Sent once per LOCAL day inside a window (3h / 2h) so a late cron never sends a stale message.
+- Button data is a short token (Telegram's 64-byte limit) mapped to {goal, session, day} in the user's settings;
+  only the latest message's buttons are valid. Locked (evidence-only) sessions can't be ticked from chat.
+- Calendar is READ-ONLY free/busy: never titles, never writes events. Only the part of a meeting that overlaps a
+  free slot is taken out (merged), before any goal plans. A failed fetch keeps the last busy times + shows an error.
+- No profiling users (age/"nature") for messages: personal = built from their own streaks and numbers.
 
 ## Reality check rules
 - The model only says whether a goal is well-known and the usual range (hours + months), labelled an AI estimate.

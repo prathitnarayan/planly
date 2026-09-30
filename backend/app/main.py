@@ -22,7 +22,7 @@ Flow:
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from urllib.parse import urlparse
 
@@ -37,14 +37,15 @@ from app.planners.reality import RealityVerdict, assess
 from app.ai.source_extract import extract_source
 from app.ai.llm import LLMClient, LLMOutputError, OpenAIClient
 from app.core import config
-from app.core import web_read
+from app.core import gcal, telegram, web_read
 from app.core.auth import current_user
 from app.core.estimate_log import make_row
 from app.core.repo import (
     DatabaseUnavailable, GoalRecord, GoalRepo, GoalSummary, InMemoryRepo, PostgresRepo, UserSettings,
 )
 from app.planners.learning import Learned, learn
-from app.planners.pool import shared_pool_taken
+from app.planners import notify as notify_logic
+from app.planners.pool import busy_taken, shared_pool_taken
 from app.planners.capacity import CapacityProfile
 from app.planners.estimate_check import EstimateWarning, check_estimates
 from app.planners.load import (
@@ -59,9 +60,10 @@ from app.planners.tasks import video_key
 from app.planners.scheduler import Schedule, build_schedule
 from app.schemas.blueprint import GoalBlueprint
 from app.schemas.interview import GoalCheck, GoalProfile, RealityCheck
+from app.schemas.integrations import GoogleLink, NotifyPrefs, TelegramLink
 from app.schemas.source import CourseSource, SourceItem, parse_duration
 
-app = FastAPI(title="Planly API", version="0.10.0")
+app = FastAPI(title="Planly API", version="0.11.0")
 
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
@@ -195,9 +197,29 @@ class Ctx:
         key = (rec.id, start)
         if key not in self._caps:
             learned = base.model_copy(update={"weekday_ratio": self.settings.learned.weekday_ratio(base.sustainable_ratio)})
-            taken = shared_pool_taken(self._higher_goals(rec), learned, start, _items)
+            taken = shared_pool_taken(self._higher_goals(rec), learned, start, _items,
+                                      initial=self.calendar_taken(learned, start))
             self._caps[key] = learned.model_copy(update={"taken": taken})
         return self._caps[key]
+
+    def calendar_taken(self, cap: CapacityProfile, start: date):
+        """Meetings from Google Calendar (read-only free/busy), cut out of your free slots."""
+        g = self.settings.google
+        if not (g.connected and gcal.available()):
+            return {}
+        now = datetime.now(timezone.utc)
+        want_from = datetime.combine(start, datetime.min.time(), timezone.utc) - timedelta(days=1)
+        stale = (not g.fetched_at or now - g.fetched_at > gcal.CACHE or not g.busy_from
+                 or g.busy_from > want_from or g.busy_until < want_from + timedelta(days=60))
+        if stale:
+            try:
+                g.busy = gcal.freebusy(gcal.decrypt(g.refresh_token_enc), want_from, want_from + gcal.HORIZON)
+                g.busy_from, g.busy_until, g.error = want_from, want_from + gcal.HORIZON, None
+            except Exception as e:                      # keep the last known busy times
+                g.error = str(e)[:200]
+            g.fetched_at = now
+            self.repo.save_settings(self.user_id, self.settings)
+        return busy_taken(g.busy, cap, self.settings.timezone, start, start + gcal.HORIZON)
 
     def _higher_goals(self, rec: GoalRecord) -> list[GoalRecord]:
         out = []
@@ -762,24 +784,29 @@ def set_tick(goal_id: str, body: Tick, ctx: Ctx = Depends()) -> TodayView:
         raise HTTPException(status_code=409, detail="that day is already closed")
     if not body.session_id.startswith(body.day.isoformat() + "|"):
         raise HTTPException(status_code=422, detail="session doesn't belong to that day")
+    _apply_tick(ctx, rec, today, body.session_id, body.done)
+    return _today_view(ctx, rec, today, save_auto=False)
+
+
+def _apply_tick(ctx: "Ctx", rec: GoalRecord, today: date, session_id: str, done: bool) -> None:
+    """Shared by the web app, the extension bar and Telegram buttons."""
     view = _today_view(ctx, rec, today)
-    session = next((s for s in view.sessions if s.id == body.session_id), None)
+    session = next((s for s in view.sessions if s.id == session_id), None)
     if session is None:
         raise HTTPException(status_code=404, detail="no such session today (the plan changed? reload)")
-    if body.done and session.locked:
+    if done and session.locked:
         raise HTTPException(status_code=423, detail=(rec.integrity.why_locked(today) or "Evidence only.")
                             + " Watch / solve it and it ticks itself.")
-    ids = set(rec.ticks.days.get(body.day.isoformat(), []))
-    if body.done:
-        ids.add(body.session_id)
-        rec.ticks.at[body.session_id] = now()
+    ids = set(rec.ticks.days.get(today.isoformat(), []))
+    if done:
+        ids.add(session_id)
+        rec.ticks.at[session_id] = now()
     else:
-        ids.discard(body.session_id)
-        rec.ticks.at.pop(body.session_id, None)
-        rec.ticks.auto = [k for k in rec.ticks.auto if k != body.session_id]
-    rec.ticks.days[body.day.isoformat()] = sorted(ids)
+        ids.discard(session_id)
+        rec.ticks.at.pop(session_id, None)
+        rec.ticks.auto = [k for k in rec.ticks.auto if k != session_id]
+    rec.ticks.days[today.isoformat()] = sorted(ids)
     ctx.save(rec)
-    return _today_view(ctx, rec, today, save_auto=False)
 
 
 # ---------- reality check: usual prep time for well-known goals vs your runway ----------
@@ -834,6 +861,309 @@ def set_goal_order(body: GoalOrder, ctx: Ctx = Depends()) -> dict:
     ctx.settings.goal_order = [g for g in body.goal_ids if g in mine]
     ctx.save_settings()
     return {"goal_order": ctx.goal_order()}
+
+
+
+# ---------- settings: timezone, notifications, Telegram, Google Calendar ----------
+
+class TelegramView(BaseModel):
+    available: bool             # the backend has a bot configured
+    linked: bool
+    username: str | None
+    bot: str | None
+
+
+class GoogleView(BaseModel):
+    available: bool
+    connected: bool
+    fetched_at: datetime | None
+    error: str | None
+    busy_hours_next_7d: float | None
+
+
+class SettingsView(BaseModel):
+    timezone: str
+    notify: NotifyPrefs
+    telegram: TelegramView
+    google: GoogleView
+
+
+def _settings_view(ctx: "Ctx") -> SettingsView:
+    st = ctx.settings
+    g = st.google
+    busy7 = None
+    if g.connected and g.busy:
+        now = datetime.now(timezone.utc)
+        busy7 = round(sum(max(0, (min(b, now + timedelta(days=7)) - max(a, now)).total_seconds())
+                          for a, b in g.busy) / 3600, 1)
+    return SettingsView(
+        timezone=st.timezone, notify=st.notify,
+        telegram=TelegramView(available=telegram.available(), linked=bool(st.telegram.chat_id),
+                              username=st.telegram.username, bot=config.TELEGRAM_BOT_USERNAME or None),
+        google=GoogleView(available=gcal.available(), connected=g.connected, fetched_at=g.fetched_at,
+                          error=g.error, busy_hours_next_7d=busy7),
+    )
+
+
+@app.get("/me/settings", response_model=SettingsView)
+def get_settings(ctx: Ctx = Depends()) -> SettingsView:
+    return _settings_view(ctx)
+
+
+class SettingsIn(BaseModel):
+    timezone: str | None = None
+    notify: NotifyPrefs | None = None
+
+
+@app.put("/me/settings", response_model=SettingsView)
+def put_settings(body: SettingsIn, ctx: Ctx = Depends()) -> SettingsView:
+    from zoneinfo import ZoneInfo
+    if body.timezone:
+        try:
+            ZoneInfo(body.timezone)
+        except Exception:
+            raise HTTPException(status_code=422, detail="unknown timezone")
+        ctx.settings.timezone = body.timezone
+    if body.notify:
+        keep = ctx.settings.notify          # don't let the client reset "already sent today"
+        ctx.settings.notify = body.notify.model_copy(update={"last_morning": keep.last_morning,
+                                                             "last_evening": keep.last_evening})
+    ctx.save_settings()
+    return _settings_view(ctx)
+
+
+# ---- Telegram ----
+
+@app.post("/me/telegram/link")
+def telegram_link(ctx: Ctx = Depends()) -> dict:
+    """One-time link: open it, tap Start in Telegram, done. Valid for 15 minutes."""
+    if not telegram.available():
+        raise HTTPException(status_code=409, detail="Telegram isn't set up on this Planly server yet.")
+    code = notify_logic.new_token().replace("-", "x").replace("_", "y")
+    ctx.settings.telegram.link_code = code
+    ctx.settings.telegram.link_expires = datetime.now(timezone.utc) + timedelta(minutes=15)
+    ctx.save_settings()
+    try:
+        telegram.ensure_webhook()
+    except telegram.TelegramError:
+        pass
+    return {"url": f"https://t.me/{config.TELEGRAM_BOT_USERNAME}?start={code}"}
+
+
+@app.delete("/me/telegram")
+def telegram_unlink(ctx: Ctx = Depends()) -> dict:
+    ctx.settings.telegram = TelegramLink()
+    ctx.save_settings()
+    return {"linked": False}
+
+
+def _local_today(ctx: "Ctx") -> date:
+    return notify_logic.local_now(datetime.now(timezone.utc), ctx.settings.timezone).date()
+
+
+def _goals_today(ctx: "Ctx", day: date) -> list[tuple[str, str, "TodayView"]]:
+    out = []
+    for gid in ctx.goal_order():
+        rec = ctx.repo.get(ctx.user_id, gid)
+        if not (rec and rec.blueprint and rec.capacity and rec.plan_start):
+            continue
+        try:
+            _close_past_days(ctx, rec, day)
+            out.append((rec.id, rec.title, _today_view(ctx, rec, day)))
+        except HTTPException:
+            continue
+    return out
+
+
+def _send_digest(ctx: "Ctx", kind: str, force: bool = False) -> bool:
+    """Morning list or evening check to the user's Telegram. Returns True if something was sent."""
+    chat = ctx.settings.telegram.chat_id
+    if not chat:
+        return False
+    day = _local_today(ctx)
+    text, buttons = notify_logic.build_message(kind, day, _goals_today(ctx, day))
+    if text is None:
+        if not force:
+            return False
+        text, buttons = ("<b>Nothing planned today.</b> Enjoy it." if kind == "morning"
+                         else "<b>All done for today.</b> ✓"), []
+    tokens = {}
+    rows = []
+    for label, data in buttons:
+        tok = notify_logic.new_token()
+        tokens[tok] = data
+        rows.append((label, f"t:{tok}"))
+    ctx.settings.telegram.buttons = tokens      # only the latest message's buttons stay valid
+    telegram.send(chat, text, rows)
+    ctx.save_settings()
+    return True
+
+
+@app.post("/me/telegram/test")
+def telegram_test(ctx: Ctx = Depends()) -> dict:
+    if not ctx.settings.telegram.chat_id:
+        raise HTTPException(status_code=409, detail="Link Telegram first.")
+    try:
+        _send_digest(ctx, "morning", force=True)
+    except telegram.TelegramError as e:
+        raise HTTPException(status_code=502, detail=f"Telegram: {e}")
+    return {"sent": True}
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request, repo: GoalRepo = Depends(get_repo)) -> dict:
+    """Updates from Telegram. Only accepted with our secret header (set via setWebhook)."""
+    if not config.TELEGRAM_WEBHOOK_SECRET or \
+            request.headers.get("X-Telegram-Bot-Api-Secret-Token") != config.TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
+    update = await request.json()
+    try:
+        _handle_update(update, repo)
+    except telegram.TelegramError:
+        pass                         # never make Telegram retry forever
+    return {"ok": True}
+
+
+HELP = ("<b>planly.</b>\n/today — today's tasks with tick buttons\n/stop — disconnect this chat\n"
+        "Morning and evening messages can be changed in Planly → Settings.")
+
+
+def _handle_update(update: dict, repo: GoalRepo) -> None:
+    if "callback_query" in update:
+        cq = update["callback_query"]
+        chat = cq.get("message", {}).get("chat", {}).get("id")
+        uid = repo.user_by_chat(chat) if chat else None
+        if not uid:
+            return telegram.answer(cq["id"], "This chat isn't linked to Planly.")
+        ctx = Ctx(user_id=uid, repo=repo)
+        data = ctx.settings.telegram.buttons.get((cq.get("data") or "")[2:])
+        if not data:
+            return telegram.answer(cq["id"], "That button is old — send /today for a fresh list.")
+        if data.get("locked"):
+            return telegram.answer(cq["id"], "Evidence only: watch it (Planly extension) and it ticks itself.")
+        rec = repo.get(uid, data["goal_id"])
+        day = date.fromisoformat(data["day"])
+        if not rec or day != _local_today(ctx):
+            return telegram.answer(cq["id"], "That day is over — send /today.")
+        current = set(rec.ticks.days.get(day.isoformat(), []))
+        done = data["session_id"] not in current
+        try:
+            _apply_tick(ctx, rec, day, data["session_id"], done)
+        except HTTPException as e:
+            return telegram.answer(cq["id"], str(e.detail)[:190])
+        telegram.answer(cq["id"], "Ticked ✓" if done else "Unticked")
+        # refresh the message so the buttons show the new state
+        text, buttons = notify_logic.build_message("morning", day, _goals_today(ctx, day))
+        if text:
+            tokens, rows = {}, []
+            for label, d in buttons:
+                tok = notify_logic.new_token()
+                tokens[tok] = d
+                rows.append((label, f"t:{tok}"))
+            ctx.settings.telegram.buttons = tokens
+            ctx.save_settings()
+            telegram.edit(chat, cq["message"]["message_id"], text, rows)
+        return
+
+    msg = update.get("message") or {}
+    chat = msg.get("chat", {}).get("id")
+    text = (msg.get("text") or "").strip()
+    if not chat or not text:
+        return
+    if text.startswith("/start"):
+        code = text.split(maxsplit=1)[1] if " " in text else ""
+        uid = repo.user_by_link_code(code) if code else None
+        if not uid:
+            return telegram.send(chat, "Open Planly → Settings → Connect Telegram to get a fresh link.")
+        ctx = Ctx(user_id=uid, repo=repo)
+        tg = ctx.settings.telegram
+        if not tg.link_expires or tg.link_expires < datetime.now(timezone.utc):
+            return telegram.send(chat, "That link expired. Get a fresh one in Planly → Settings.")
+        other = repo.user_by_chat(chat)
+        if other and other != uid:
+            return telegram.send(chat, "This Telegram chat is already linked to another Planly account.")
+        tg.chat_id, tg.link_code, tg.link_expires = chat, None, None
+        tg.username = (msg.get("from") or {}).get("username")
+        ctx.save_settings()
+        return telegram.send(chat, "✓ Linked to Planly. You'll get today's tasks in the morning and one "
+                                   "check in the evening (change or turn off in Settings).\n\n" + HELP)
+    uid = repo.user_by_chat(chat)
+    if not uid:
+        return telegram.send(chat, "This chat isn't linked yet. Planly → Settings → Connect Telegram.")
+    ctx = Ctx(user_id=uid, repo=repo)
+    if text.startswith("/today"):
+        _send_digest(ctx, "morning", force=True)
+    elif text.startswith("/stop"):
+        ctx.settings.telegram = TelegramLink()
+        ctx.save_settings()
+        telegram.send(chat, "Disconnected. Planly won't message this chat again.")
+    else:
+        telegram.send(chat, HELP)
+
+
+@app.post("/cron/notify")
+def cron_notify(request: Request, repo: GoalRepo = Depends(get_repo)) -> dict:
+    """Called every ~15 min (GitHub Actions / cron-job.org). Sends each user's morning list and
+    evening check once, in their own timezone. Also keeps the free Render instance awake."""
+    if not config.CRON_SECRET or request.headers.get("X-Cron-Secret") != config.CRON_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
+    try:
+        telegram.ensure_webhook()
+    except telegram.TelegramError:
+        pass
+    sent, now_ = [], datetime.now(timezone.utc)
+    for uid in repo.telegram_users():
+        ctx = Ctx(user_id=uid, repo=repo)
+        for kind in notify_logic.due(now_, ctx.settings.notify, ctx.settings.timezone):
+            day = _local_today(ctx)
+            try:
+                if _send_digest(ctx, kind):
+                    sent.append(kind)
+            except telegram.TelegramError:
+                continue
+            setattr(ctx.settings.notify, f"last_{kind}", day)     # once a day, sent or nothing to say
+            ctx.save_settings()
+    return {"sent": len(sent)}
+
+
+# ---- Google Calendar (read-only free/busy) ----
+
+@app.get("/me/google/connect")
+def google_connect(ctx: Ctx = Depends()) -> dict:
+    if not gcal.available():
+        raise HTTPException(status_code=409, detail="Google Calendar isn't set up on this Planly server yet.")
+    return {"url": gcal.auth_url(ctx.user_id)}
+
+
+@app.get("/google/callback")
+def google_callback(code: str | None = None, state: str | None = None, error: str | None = None,
+                    repo: GoalRepo = Depends(get_repo)):
+    from fastapi.responses import RedirectResponse
+    back = f"{config.FRONTEND_URL}/settings"
+    if error or not code or not state:
+        return RedirectResponse(f"{back}?google=cancelled")
+    try:
+        uid = gcal.user_from_state(state)
+        refresh = gcal.exchange(code)
+    except gcal.CalendarError:
+        return RedirectResponse(f"{back}?google=failed")
+    st = repo.get_settings(uid)
+    st.google = GoogleLink(refresh_token_enc=gcal.encrypt(refresh), connected_at=datetime.now(timezone.utc))
+    repo.save_settings(uid, st)
+    return RedirectResponse(f"{back}?google=connected")
+
+
+@app.delete("/me/google")
+def google_disconnect(ctx: Ctx = Depends()) -> dict:
+    g = ctx.settings.google
+    if g.refresh_token_enc:
+        try:
+            gcal.revoke(gcal.decrypt(g.refresh_token_enc))
+        except Exception:
+            pass
+    ctx.settings.google = GoogleLink()
+    ctx.save_settings()
+    return {"connected": False}
 
 
 # ---------- evidence from the Chrome extension ----------

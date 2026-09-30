@@ -18,7 +18,10 @@ export default function RootLayout({ children }: { children: ReactNode }) {
             <Link href="/" className="text-lg font-bold tracking-tight">
               planly<span className="text-muted">.</span>
             </Link>
-            <SignOut />
+            <span className="flex items-center gap-4">
+              <Link href="/settings" className="text-xs text-muted hover:text-ink hover:underline underline-offset-4">Settings</Link>
+              <SignOut />
+            </span>
           </nav>
           <main className="pt-10">
             <AuthGate>{children}</AuthGate>
