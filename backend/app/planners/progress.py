@@ -254,6 +254,8 @@ class TodaySession(BaseModel):
     items: list[SessionItem] = Field(default_factory=list)   # the lectures / problems it covers
     checkable: bool = False      # has items the evidence can confirm
     auto: bool = False           # ticked by the evidence, not by hand
+    excused: bool = False        # "something came up" covers it (breaks.py); can still be ticked
+    excused_free: bool = True    # within the monthly allowance (else it still counts as missed)
     locked: bool = False         # evidence-only: can't be ticked by hand right now
 
 
@@ -312,11 +314,14 @@ def day_plan(blueprint, items, checkins, capacity, day: date,
 def close_days(
     blueprint, items, checkins: list[CheckIn], capacity, ticks: dict[str, list[str]],
     first: date, last: date, ctx: DayContext | None = None,
-    ticked_at: dict[str, datetime] | None = None,
+    ticked_at: dict[str, datetime] | None = None, breaks: list | None = None,
 ) -> tuple[list[CheckIn], list[str], Integrity, list[Outcome]]:
     """Turn ticks on days first..last (inclusive) into VERIFIED check-ins, one day at a time,
     so each day is judged against the plan the user actually saw that morning.
-    Returns (new check-ins, plain-language notes, updated integrity, outcomes to learn from)."""
+    Returns (new check-ins, plain-language notes, updated integrity, outcomes to learn from).
+    `breaks`: "something came up" (planners/breaks.py). Sessions excused within the allowance are
+    not misses: no streak reset, nothing learned from them; the work still moves forward."""
+    from app.planners.breaks import excused_ids, made_on
     ctx = (ctx or DayContext()).model_copy()
     sites = ctx.sites()
     new: list[CheckIn] = []
@@ -326,6 +331,8 @@ def close_days(
     while day <= last:
         sessions, later = day_plan(blueprint, items, checkins + new, capacity, day, ctx)
         ticked = set(ticks.get(day.isoformat(), []))
+        excused = excused_ids(sessions, ticked, made_on(breaks or [], day))
+        free_ex = {k for k, f in excused.items() if f}
         results = []
         credit: dict[str, int] = {}
         verdict_by: dict[str, str] = {}
@@ -344,22 +351,36 @@ def close_days(
         for s in sessions:
             by_ms.setdefault(s.milestone_key, []).append(s)
         for key, ss in by_ms.items():
-            planned = sum(s.minutes for s in ss)
+            planned = sum(s.minutes for s in ss if s.id not in free_ex)
             did = sum(credit.get(s.id, 0) for s in ss)
+            ex_free = sum(s.minutes for s in ss if s.id in free_ex)
+            ex_paid = sum(s.minutes for s in ss if s.id in excused and s.id not in free_ex)
+            if ex_free:
+                notes.append(f"{day:%a %d %b}: {ex_free} min of {ss[0].milestone_name} excused (something came up) "
+                             "— moved to the coming days, no streak lost.")
+            if ex_paid:
+                notes.append(f"{day:%a %d %b}: {ex_paid} min of {ss[0].milestone_name} excused past your monthly "
+                             "allowance — counted as missed, moved to the coming days.")
+            if planned == 0 and not did:
+                continue                         # everything planned for it was excused
             outcome = "done" if did >= planned else "partial" if did else "missed"
             # Credited the whole last planned piece of a milestone = it's finished.
-            complete = outcome == "done" and key not in later
+            # (not if part of it was excused: that work still has to happen)
+            complete = outcome == "done" and key not in later and not any(s.id in excused for s in ss)
             new.append(CheckIn(day=day, milestone_key=key, outcome=outcome, planned_minutes=planned,
                                actual_minutes=min(did, planned) if did else 0,
                                milestone_complete=complete, note="ticks"))
-            unticked = sum(s.minutes for s in ss if s.id not in ticked)
+            unticked = sum(s.minutes for s in ss if s.id not in ticked and s.id not in excused)
             if unticked:
                 notes.append(f"{day:%a %d %b}: {unticked} min of {ss[0].milestone_name} not done "
                              "— spread over the next days.")
         for s in sessions:
+            if s.id in free_ex:
+                continue                         # a one-off emergency says nothing about this weekday
             outcomes.append(_outcome(s, day, credit.get(s.id, 0), s.id in ticked,
                                      verdict_by.get(s.id), ctx.evidence))
-        ctx.integrity = apply_day(ctx.integrity, day, results, anything_planned=bool(sessions))
+        ctx.integrity = apply_day(ctx.integrity, day, results,
+                                  anything_planned=any(s.id not in free_ex for s in sessions))
         day += timedelta(days=1)
     return new, notes, ctx.integrity, outcomes
 

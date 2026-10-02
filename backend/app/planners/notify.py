@@ -55,7 +55,7 @@ def _mins(m: int) -> str:
 
 def _session_line(s) -> str:
     when = f"{s.start}–{s.end}" if s.start else f"{s.minutes} min"
-    mark = "✓" if s.done else ("⊘" if s.locked else "○")
+    mark = "✓" if s.done else "–" if getattr(s, "excused", False) else ("⊘" if s.locked else "○")
     line = f"{mark} {html.escape(when)}  {html.escape(s.milestone_name)}"
     if s.items:
         line += "\n     " + html.escape(", ".join(i.title for i in s.items[:4]) + (" …" if len(s.items) > 4 else ""))
@@ -88,8 +88,8 @@ def _ask_row(b: HabitBrief, day: date, when: str) -> list:
 
 
 def build_message(kind: str, day: date, goals: list[tuple[str, str, object]],
-                  habits: list[HabitBrief] | tuple = (), quote: tuple[str, str] | None = None
-                  ) -> tuple[str | None, list[list]]:
+                  habits: list[HabitBrief] | tuple = (), quote: tuple[str, str] | None = None,
+                  note: str | None = None) -> tuple[str | None, list[list]]:
     """goals: [(goal_id, goal_title, TodayView)]; habits: HabitBrief per active habit; quote: (text, author).
     Returns (html text, button rows) or (None, []) when there's nothing worth sending.
     Button data: tick {goal_id, session_id, day, locked} | habit {t:"h", habit_id, day, kept}.
@@ -98,14 +98,16 @@ def build_message(kind: str, day: date, goals: list[tuple[str, str, object]],
     blocks, rows = [], []
     planned = done = open_ = 0
     for gid, title, view in goals:
-        sessions = view.sessions if kind == "morning" else [s for s in view.sessions if not s.done]
+        # excused ("something came up") sessions aren't open: the evening doesn't ask about them
+        sessions = view.sessions if kind == "morning" else [s for s in view.sessions
+                                                            if not s.done and not getattr(s, "excused", False)]
         if not sessions:
             continue
         blocks.append(f"<b>{html.escape(title)}</b>\n" + "\n".join(_session_line(s) for s in sessions))
         for s in view.sessions:
             planned += s.minutes
             done += s.minutes if s.done else 0
-            open_ += 0 if s.done else 1
+            open_ += 0 if s.done or getattr(s, "excused", False) else 1
         for s in sessions:
             label = ("✓ " if s.done else "⊘ " if s.locked else "Tick: ") + s.milestone_name
             label += f" {s.start}" if s.start else ""
@@ -132,7 +134,9 @@ def build_message(kind: str, day: date, goals: list[tuple[str, str, object]],
                 habit_lines.append(f"{mark} {html.escape(b.habit.shown)} — day {b.stats.current}")
     ask_today = kind == "evening" and any(b.stats.today is None for b in habits)
 
-    if kind == "morning" and not (blocks or habits or quote):
+    if kind == "evening" and blocks:
+        rows.append([("🌧 Something came up — skip the rest of today", {"t": "x"})])
+    if kind == "morning" and not (blocks or habits or quote or note):
         return None, []
     if kind == "evening" and not (blocks or ask_today):
         return None, []
@@ -146,6 +150,8 @@ def build_message(kind: str, day: date, goals: list[tuple[str, str, object]],
         parts.append(f"<b>Still open today</b> — {open_} session{'s' if open_ != 1 else ''}")
     else:
         parts.append("<b>Evening check</b>")
+    if note:
+        parts.append(f"<i>{html.escape(note)}</i>")
     parts += blocks
     if habit_lines:
         parts.append("\n".join(habit_lines))

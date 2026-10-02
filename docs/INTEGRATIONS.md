@@ -72,5 +72,10 @@ Nothing to configure. Once Telegram is connected:
 - **Heads-up**: at most one a day, 30 minutes before *your* usual urge time. It only starts after
   you've logged a few urges (/urge in Telegram, or "Urge right now" on the Habits page).
 - Telegram shows a habit's **lock-screen name** (e.g. "H1") instead of its real name, if you set one.
-- Bot commands: `/today`, `/urge`, `/stop`.
+- Bot commands: `/today`, `/urge`, `/skip`, `/stop`.
+
+## 7. "Something came up" (API 0.13.0)
+No setup, no migration. On a goal's Today card → **Something came up?**: lost some time, skip the rest of
+today, or away for days. In Telegram: the evening message has a "Something came up" button, or send `/skip`.
+Only work that hasn't ended yet can be excused, and same-day excuses get 4 free days per 30.
 

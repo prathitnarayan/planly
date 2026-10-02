@@ -85,4 +85,5 @@ def ensure_webhook() -> None:
 
 COMMANDS = [{"command": "today", "description": "Today's quote, tasks and habits"},
             {"command": "urge", "description": "Log a craving right now"},
+            {"command": "skip", "description": "Something came up: excuse the rest of today"},
             {"command": "stop", "description": "Disconnect this chat"}]

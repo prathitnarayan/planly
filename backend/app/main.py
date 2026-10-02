@@ -43,6 +43,7 @@ from app.core.estimate_log import make_row
 from app.core.repo import (
     DatabaseUnavailable, GoalRecord, GoalRepo, GoalSummary, InMemoryRepo, PostgresRepo, UserSettings,
 )
+from app.planners import breaks as break_logic
 from app.planners import habits as habit_logic
 from app.planners.habits import Habit, HabitStats, Urge
 from app.planners.learning import Learned, learn
@@ -65,7 +66,7 @@ from app.schemas.interview import GoalCheck, GoalProfile, RealityCheck
 from app.schemas.integrations import GoogleLink, NotifyPrefs, TelegramLink
 from app.schemas.source import CourseSource, SourceItem, parse_duration
 
-app = FastAPI(title="Planly API", version="0.12.0")
+app = FastAPI(title="Planly API", version="0.13.0")
 
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
@@ -198,7 +199,10 @@ class Ctx:
         self._caps = self._caps or {}
         key = (rec.id, start)
         if key not in self._caps:
-            learned = base.model_copy(update={"weekday_ratio": self.settings.learned.weekday_ratio(base.sustainable_ratio)})
+            # days off told in advance ("away Fri-Sun") have no study time at all (breaks.py)
+            off = {d: 0 for d in break_logic.off_days(self.settings.breaks) if d >= start}
+            learned = base.model_copy(update={"weekday_ratio": self.settings.learned.weekday_ratio(base.sustainable_ratio),
+                                              "overrides": {**base.overrides, **off}})
             taken = shared_pool_taken(self._higher_goals(rec), learned, start, _items,
                                       initial=self.calendar_taken(learned, start))
             self._caps[key] = learned.model_copy(update={"taken": taken})
@@ -614,7 +618,7 @@ def _close_past_days(ctx: "Ctx", rec: GoalRecord, today: date) -> None:
     try:
         new, notes, integrity, outcomes = close_days(
             rec.blueprint, _items(rec), rec.checkins, ctx.cap(rec, first),
-            rec.ticks.days, first, last, _day_ctx(ctx, rec), rec.ticks.at)
+            rec.ticks.days, first, last, _day_ctx(ctx, rec), rec.ticks.at, breaks=ctx.settings.breaks)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     if new:
@@ -663,6 +667,7 @@ class TodayView(BaseModel):
     can_start_today: bool = False                              # plan starts later and nothing is logged yet
     watched: dict[str, float] = Field(default_factory=dict)    # video key -> share of the planned part played
     standing: Standing | None = None
+    excused_minutes: int = 0                                   # "something came up" (breaks.py)
 
 
 def _standing(rec: GoalRecord, today: date) -> Standing:
@@ -726,6 +731,10 @@ def _today_view_inner(ctx: "Ctx", rec: GoalRecord, today: date, dctx: DayContext
         s.done = s.id in ticked
         s.auto = s.id in rec.ticks.auto
         s.locked = evidence_only and s.checkable and not s.done
+    excused = break_logic.excused_ids(sessions, ticked, break_logic.made_on(ctx.settings.breaks, today))
+    for s in sessions:
+        s.excused = s.id in excused and not s.done
+        s.excused_free = excused.get(s.id, True)
     if changed and save_auto:
         rec.ticks.days[key] = sorted(ticked)
         ctx.save(rec)
@@ -734,9 +743,12 @@ def _today_view_inner(ctx: "Ctx", rec: GoalRecord, today: date, dctx: DayContext
         for it in s.items:
             if it.video_key and it.video_key in dctx.evidence:
                 watched[it.video_key] = round(coverage(dctx.evidence[it.video_key], it.part_from, it.part_to), 2)
+    day_off = today in break_logic.off_days(ctx.settings.breaks)
     return TodayView(day=today, sessions=sessions, planned_minutes=sum(s.minutes for s in sessions),
                      done_minutes=sum(s.minutes for s in sessions if s.done), moved=moved, watched=watched,
-                     message=None if sessions else "Nothing planned today.")
+                     excused_minutes=sum(s.minutes for s in sessions if s.excused),
+                     message=None if sessions else ("Day off — you said something came up. The work moved to "
+                                                    "the coming days." if day_off else "Nothing planned today."))
 
 
 @app.get("/goals/{goal_id}/today", response_model=TodayView)
@@ -978,6 +990,94 @@ def _goals_today(ctx: "Ctx", day: date) -> list[tuple[str, str, "TodayView"]]:
     return out
 
 
+# ---- "something came up" (breaks.py) ----
+
+class BreakItem(BaseModel):
+    brk: break_logic.Break
+    label: str
+    can_undo: bool
+
+
+class BreaksView(BaseModel):
+    today: date
+    breaks: list[BreakItem]
+    tally: break_logic.Tally
+    allowance: float = break_logic.ALLOWANCE_DAYS
+    cost: dict[str, float] = {"minutes": break_logic.MINUTES_COST, "rest_of_day": 1.0, "days_from_today": 1.0,
+                              "days_ahead": 0.0}
+
+
+def _can_undo(b: break_logic.Break, today: date) -> bool:
+    """Today's excuse (until the day closes) and anything still ahead. A closed day stays judged."""
+    return b.last >= today and (b.created_day == today or b.first > today)
+
+
+def _breaks_view(ctx: "Ctx") -> BreaksView:
+    today = _local_today(ctx)
+    bs = sorted([b for b in ctx.settings.breaks if b.last >= today - timedelta(days=break_logic.TALLY_DAYS)],
+                key=lambda b: (b.first, b.at), reverse=True)
+    return BreaksView(today=today, tally=break_logic.tally(ctx.settings.breaks, today),
+                      breaks=[BreakItem(brk=b, label=break_logic.describe(b), can_undo=_can_undo(b, today)) for b in bs])
+
+
+@app.get("/me/breaks", response_model=BreaksView)
+def get_breaks(ctx: Ctx = Depends()) -> BreaksView:
+    return _breaks_view(ctx)
+
+
+class BreakIn(BaseModel):
+    kind: break_logic.BreakKind
+    minutes: int | None = None
+    first: date | None = None
+    last: date | None = None
+    reason: break_logic.Reason | None = None
+    note: str | None = Field(default=None, max_length=120)
+
+
+def _add_break(ctx: "Ctx", body: BreakIn) -> break_logic.Break:
+    local = notify_logic.local_now(datetime.now(timezone.utc), ctx.settings.timezone)
+    today = local.date()
+    first = body.first or today if body.kind == "days" else today
+    last = body.last or first if body.kind == "days" else today
+    if body.kind == "days":
+        if first > today + timedelta(days=break_logic.MAX_DAYS_AHEAD):
+            raise HTTPException(status_code=422, detail=f"a break can start at most {break_logic.MAX_DAYS_AHEAD} days ahead")
+        if (last - first).days + 1 > break_logic.MAX_SPAN_DAYS:
+            raise HTTPException(status_code=422, detail=f"at most {break_logic.MAX_SPAN_DAYS} days at once")
+    try:
+        b = break_logic.Break(kind=body.kind, created_day=today, first=first, last=last, minutes=body.minutes,
+                              reason=body.reason, note=body.note, at_local=local.time().replace(microsecond=0))
+    except ValueError as e:
+        msg = e.errors()[0]["msg"] if hasattr(e, "errors") else str(e)
+        raise HTTPException(status_code=422, detail=msg.removeprefix("Value error, "))
+    if break_logic.same_day(b) and any(x.kind != "minutes" for x in break_logic.made_on(ctx.settings.breaks, today)):
+        raise HTTPException(status_code=409, detail="The rest of today is already excused.")
+    # the allowance: same-day excuses past it still move the work, but count as missed
+    b.free = break_logic.cost(b) <= break_logic.allowance_left(ctx.settings.breaks, today) + 1e-9
+    ctx.settings.breaks = break_logic.prune(ctx.settings.breaks, today) + [b]
+    ctx.save_settings()
+    return b
+
+
+@app.post("/me/breaks", response_model=BreaksView)
+def add_break(body: BreakIn, ctx: Ctx = Depends()) -> BreaksView:
+    _add_break(ctx, body)
+    return _breaks_view(ctx)
+
+
+@app.delete("/me/breaks/{break_id}", response_model=BreaksView)
+def remove_break(break_id: str, ctx: Ctx = Depends()) -> BreaksView:
+    today = _local_today(ctx)
+    b = next((x for x in ctx.settings.breaks if x.id == break_id), None)
+    if not b:
+        raise HTTPException(status_code=404, detail="break not found")
+    if not _can_undo(b, today):
+        raise HTTPException(status_code=409, detail="that day is over and already counted")
+    ctx.settings.breaks = [x for x in ctx.settings.breaks if x.id != break_id]
+    ctx.save_settings()
+    return _breaks_view(ctx)
+
+
 # ---- habits (008): streaks, the user's own risky times, daily quote ----
 
 class HabitView(BaseModel):
@@ -1138,7 +1238,9 @@ def log_urge(habit_id: str, ctx: Ctx = Depends()) -> UrgeOut:
 def _render(ctx: "Ctx", kind: str, day: date) -> tuple[str | None, list]:
     """The morning / evening message as it stands right now (also used to refresh after a tap)."""
     quote = habit_logic.quote_for(ctx.user_id, day) if kind == "morning" and ctx.settings.notify.quote else None
-    return notify_logic.build_message(kind, day, _goals_today(ctx, day), _briefs(_habit_views(ctx, day)), quote)
+    note = ("Day off — you said something came up. Your work moved to the coming days."
+            if day in break_logic.off_days(ctx.settings.breaks) else None)
+    return notify_logic.build_message(kind, day, _goals_today(ctx, day), _briefs(_habit_views(ctx, day)), quote, note)
 
 
 def _tokens(ctx: "Ctx", rows: list, kind: str, day: date) -> list[list[tuple[str, str]]]:
@@ -1224,7 +1326,27 @@ async def telegram_webhook(request: Request, repo: GoalRepo = Depends(get_repo))
 
 
 HELP = ("<b>planly.</b>\n/today — today's quote, tasks and habits\n/urge — log a craving right now\n"
+        "/skip — something came up: excuse the rest of today\n"
         "/stop — disconnect this chat\nMessage times can be changed in Planly → Settings.")
+
+
+def _skip_today(ctx: "Ctx") -> str:
+    """Telegram's 'something came up': the rest of today, same checks as the web."""
+    try:
+        b = _add_break(ctx, BreakIn(kind="rest_of_day"))
+    except HTTPException as e:
+        return str(e.detail)
+    day = b.created_day
+    open_now = sum(s.minutes for _, _, v in _goals_today(ctx, day) for s in v.sessions if s.excused)
+    if not open_now:
+        return ("Noted — but nothing still ahead today could be excused (sessions that already ended "
+                "stay as they are). Say it when it happens next time.")
+    if not b.free:
+        return (f"Excused {open_now} min. That's past your {break_logic.ALLOWANCE_DAYS:g} free days this month, "
+                "so it moves to the coming days but counts as missed.")
+    left = break_logic.allowance_left(ctx.settings.breaks, day)
+    return (f"Excused {open_now} min — moved to the coming days, no streak lost. "
+            f"{left:g} free day{'s' if left != 1 else ''} left this month.")
 
 
 def _refresh(ctx: "Ctx", chat: int, message_id: int, kind: str, day: date) -> None:
@@ -1257,6 +1379,14 @@ def _handle_callback(cq: dict, repo: GoalRepo) -> None:
             return telegram.answer(cq["id"], "That habit was removed.")
         telegram.answer(cq["id"], "Logged")
         return telegram.send(chat, _log_urge(ctx, h))
+
+    if data.get("t") == "x":                                   # something came up: skip the rest of today
+        if data.get("made") != today.isoformat():
+            return telegram.answer(cq["id"], "That day is over.")
+        telegram.answer(cq["id"], _skip_today(ctx))
+        if msg_id:
+            _refresh(ctx, chat, msg_id, kind, today)
+        return
 
     if data.get("t") == "h":                                   # habit yes / no
         h = repo.get_habit(uid, data["habit_id"])
@@ -1335,6 +1465,8 @@ def _handle_update(update: dict, repo: GoalRepo) -> None:
             rows = [[(f"🔥 {h.shown}"[:60], {"t": "u", "habit_id": h.id})] for h in hs]
             telegram.send(chat, "Which one?", _tokens(ctx, rows, "nudge", day))
             ctx.save_settings()
+    elif text.startswith("/skip"):
+        telegram.send(chat, _skip_today(ctx))
     elif text.startswith("/stop"):
         ctx.settings.telegram = TelegramLink()
         ctx.save_settings()

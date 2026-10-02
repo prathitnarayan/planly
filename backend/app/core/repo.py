@@ -26,6 +26,7 @@ from app.planners.capacity import CapacityProfile
 from app.planners.progress import CheckIn
 from app.schemas.blueprint import GoalBlueprint
 from app.planners.integrity import Integrity, WatchEvidence, merge_intervals
+from app.planners.breaks import Break
 from app.planners.habits import Habit, HabitDay, Urge
 from app.planners.learning import Learned, Outcome
 from app.schemas.integrations import GoogleLink, NotifyPrefs, TelegramLink
@@ -67,10 +68,12 @@ class UserSettings(BaseModel):
     notify: NotifyPrefs = Field(default_factory=NotifyPrefs)
     telegram: TelegramLink = Field(default_factory=TelegramLink)
     google: GoogleLink = Field(default_factory=GoogleLink)
+    breaks: list[Break] = Field(default_factory=list)     # "something came up" (planners/breaks.py)
 
     def integrations(self) -> dict:
         return {"notify": self.notify.model_dump(mode="json"), "telegram": self.telegram.model_dump(mode="json"),
-                "google": self.google.model_dump(mode="json")}
+                "google": self.google.model_dump(mode="json"),
+                "breaks": [b.model_dump(mode="json") for b in self.breaks]}
 
 
 class GoalSummary(BaseModel):
@@ -459,7 +462,8 @@ class PostgresRepo:
                             timezone=row[3] or "Asia/Kolkata",
                             notify=NotifyPrefs.model_validate(extra.get("notify") or {}),
                             telegram=TelegramLink.model_validate(extra.get("telegram") or {}),
-                            google=GoogleLink.model_validate(extra.get("google") or {}))
+                            google=GoogleLink.model_validate(extra.get("google") or {}),
+                            breaks=[Break.model_validate(b) for b in extra.get("breaks") or []])
 
     def save_settings(self, user_id, settings):
         from psycopg.types.json import Jsonb

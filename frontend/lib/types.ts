@@ -190,6 +190,7 @@ export type TodaySession = {
   id: string; day: string; start: string | null; end: string | null; minutes: number;
   milestone_key: string; milestone_name: string; deliverable: string | null; kind: string; done: boolean;
   items: SessionItem[]; checkable: boolean; auto: boolean; locked: boolean;
+  excused: boolean; excused_free: boolean;
 };
 export type Verdict = "verified" | "partial" | "self" | "mismatch";
 export type IntegrityEvent = {
@@ -204,7 +205,7 @@ export type TodayView = {
   day: string; sessions: TodaySession[]; planned_minutes: number; done_minutes: number;
   moved: string[]; closed: boolean; message: string | null;
   next_day: string | null; next_sessions: TodaySession[]; can_start_today: boolean;
-  watched: Record<string, number>; standing: Standing | null;
+  watched: Record<string, number>; standing: Standing | null; excused_minutes: number;
 };
 
 export type LearnedView = {
@@ -250,4 +251,19 @@ export type HabitStats = {
 export type HabitView = {
   habit: Habit; stats: HabitStats; lines: string[];
   risk_time: string | null; risk_day: string | null; urges_7d: number;
+};
+
+// ---- "something came up" ----
+export type BreakKind = "minutes" | "rest_of_day" | "days";
+export type BreakReason = "health" | "family" | "work" | "travel" | "other";
+export type Break = {
+  id: string; kind: BreakKind; created_day: string; first: string; last: string; minutes: number | null;
+  reason: BreakReason | null; note: string | null; free: boolean;
+};
+export type BreaksView = {
+  today: string;
+  breaks: { brk: Break; label: string; can_undo: boolean }[];
+  tally: { times: number; days_off: number; minutes: number; allowance_left: number; over_allowance: number; pattern: string | null };
+  allowance: number;
+  cost: Record<string, number>;
 };

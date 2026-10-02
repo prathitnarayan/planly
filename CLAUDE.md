@@ -39,6 +39,8 @@ backend/app/
   planners/reality.py    reality check: AI gives the commonly quoted prep range for WELL-KNOWN goals (UPSC, CAT,
                          marathon...); code compares with deadline + free time -> ok / tight / unrealistic (warn only)
   planners/notify.py     when to message (morning/evening windows, once per local day, habit nudge) + text/buttons
+  planners/breaks.py     "something came up": lost minutes / rest of today / days away -> excused sessions + days off,
+                         with anti-faking checks (say it when it happens, 4 free days per 30, patterns named)
   planners/habits.py     habit streaks (current / best / 30-day record, blanks skipped), risky time from the
                          user's own urge log, risky weekday from their slips, personal lines, daily quote
   core/telegram.py       Bot API calls; webhook auto-registered (secret header). core/gcal.py: Google OAuth,
@@ -172,6 +174,8 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
 - [x] Habit streaks + daily quote (API 0.12.0, 008_habits.sql): /habits CRUD, PUT /habits/{id}/days,
       POST /habits/{id}/urges; Habits page; Telegram yes/no buttons, /urge, one heads-up a day at the
       user's own risky time; quote at the top of every morning message, even with no goals
+- [x] "Something came up" (API 0.13.0, no migration: stored in user_settings.integrations.breaks): /me/breaks
+      GET/POST/DELETE, panel on the Today card, excused rows, Telegram evening button + /skip
 - [ ] Learning stage 2 (crowd priors per course item) and 3 (model); long-haul mode (phases, rolling detail,
       revision cycles, books, mock scores, fixed daily blocks)
 - [ ] Codeforces/LeetCode solved via their APIs (stronger practice evidence); trust per user instead of per goal
@@ -195,6 +199,17 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
 - Calendar is READ-ONLY free/busy: never titles, never writes events. Only the part of a meeting that overlaps a
   free slot is taken out (merged), before any goal plans. A failed fetch keeps the last busy times + shows an error.
 - No profiling users (age/"nature") for messages: personal = built from their own streaks and numbers.
+
+## "Something came up" rules (planners/breaks.py)
+- TODAY is never re-planned: unticked sessions are marked excused (ids stay stable). FUTURE days in a
+  "days" break get capacity 0 (overrides, computed in Ctx.cap, never saved), so the planner routes around them.
+- Excused within the allowance = not a miss: no "missed" check-in, no streak reset, no learning outcome.
+  The work still moves forward. A milestone is never marked complete on a day part of it was excused.
+- Checks: only sessions not yet ended (+1 h grace) at the time of the excuse; never ticked ones; never past
+  days. Same-day excuses get 4 free days per 30 (lost time = ½); past that it still moves the work but
+  counts as missed. Told-ahead days off are free. One "rest of today" per day. Same weekday excused
+  >= 3 times in 5 weeks -> named as a pattern with a suggestion to lower that day's free time.
+- Undo: today's excuse until the day closes, and anything still ahead. Closed days stay judged.
 
 ## Habit rules
 - Self-report only, so NO penalties, trust or locks. A slip resets the current streak; best streak and

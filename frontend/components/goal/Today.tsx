@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { ErrorNote } from "@/components/ui";
+import { CameUp } from "./CameUp";
 import { api } from "@/lib/api";
 import { day, parseDay, pretty, shortName } from "@/lib/format";
 import type { IntegrityEvent, SessionItem, Standing, TodaySession, TodayView } from "@/lib/types";
@@ -68,13 +69,18 @@ function Row({ s, onToggle, busy, preview, watched = {} }: {
   const when = s.start ? `${s.start}–${s.end}` : `${s.minutes} min`;
   const inner = (
     <>
-      <Box done={s.done} disabled={preview} locked={s.locked} />
+      <Box done={s.done} disabled={preview || s.excused} locked={s.locked} />
       <span className="min-w-0 flex-1">
         <span className="strike text-[15px] leading-snug" data-done={s.done}>{shortName(s.milestone_name, s.deliverable)}</span>
         <span className="mt-0.5 block text-xs text-muted">
           {pretty(s.deliverable)} · {s.kind}
           {s.auto && <strong className="ml-1 font-medium text-ink">· ticked by evidence</strong>}
           {s.locked && <span className="ml-1">· ticks itself when watched / solved</span>}
+          {s.excused && (
+            <strong className="ml-1 font-medium text-ink">
+              · excused{s.excused_free ? " — moves to the coming days" : " — past your allowance, counts as missed"}
+            </strong>
+          )}
         </span>
         <Items items={s.items} watched={watched} />
       </span>
@@ -187,8 +193,9 @@ export function Today({ goalId, view, onChange, onStarted }: {
 
   const d = parseDay(view.day);
   const has = view.sessions.length > 0;
-  const ratio = view.planned_minutes ? view.done_minutes / view.planned_minutes : 0;
-  const left = view.sessions.filter((s) => !s.done).length;
+  const due = view.planned_minutes - (view.excused_minutes ?? 0);
+  const ratio = due > 0 ? Math.min(1, view.done_minutes / due) : 0;
+  const left = view.sessions.filter((s) => !s.done && !s.excused).length;
   const allDone = has && left === 0;
 
   return (
@@ -206,7 +213,7 @@ export function Today({ goalId, view, onChange, onStarted }: {
         {has && (
           <div className="relative flex items-center justify-center">
             <Ring value={ratio} />
-            <span className="num absolute text-sm font-semibold">{Math.round(ratio * 100)}%</span>
+            <span className="num absolute text-sm font-semibold">{due > 0 || view.done_minutes ? `${Math.round(ratio * 100)}%` : "off"}</span>
           </div>
         )}
       </div>
@@ -230,8 +237,10 @@ export function Today({ goalId, view, onChange, onStarted }: {
           </ul>
           <p className="num border-t border-line px-5 py-3 text-xs text-muted">
             {allDone
-              ? <span className="font-semibold text-ink">✓ Day done — {view.done_minutes} min. Nice.</span>
-              : <>{view.done_minutes} of {view.planned_minutes} min · {left} left. Unticked tonight = moved to the coming days, spread out.</>}
+              ? <span className="font-semibold text-ink">
+                  {view.excused_minutes ? `✓ Done for today — ${view.done_minutes} min, the rest excused.` : `✓ Day done — ${view.done_minutes} min. Nice.`}
+                </span>
+              : <>{view.done_minutes} of {due} min · {left} left. Unticked tonight = moved to the coming days, spread out.</>}
           </p>
           {view.sessions.some((s) => s.items.length) && (
             <p className="border-t border-line px-5 py-2.5 text-[11px] text-muted">
@@ -261,6 +270,7 @@ export function Today({ goalId, view, onChange, onStarted }: {
           )}
         </div>
       )}
+      {!view.closed && <CameUp onDone={onStarted} />}
       <div className="px-5"><ErrorNote error={error} /></div>
     </section>
   );

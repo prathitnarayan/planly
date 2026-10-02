@@ -398,3 +398,15 @@ def test_habits_roundtrip_and_isolation(repo):
     assert repo.list_urges(BOB, date(2026, 9, 1)) == []
     assert repo.delete_habit(BOB, h.id) is False and repo.delete_habit(ALICE, h.id) is True
     assert repo.habit_days(ALICE, date(2026, 9, 1)) == [] and repo.list_urges(ALICE, date(2026, 9, 1)) == []
+
+
+def test_breaks_roundtrip(repo):
+    from datetime import time
+    from app.core.repo import UserSettings
+    from app.planners.breaks import Break
+    st = UserSettings()
+    st.breaks = [Break(kind="minutes", minutes=60, created_day=date(2026, 10, 5), first=date(2026, 10, 5),
+                       last=date(2026, 10, 5), at_local=time(18, 30), reason="work", free=False)]
+    repo.save_settings(ALICE, st)
+    got = repo.get_settings(ALICE).breaks
+    assert got == st.breaks and repo.get_settings(BOB).breaks == []
