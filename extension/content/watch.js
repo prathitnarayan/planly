@@ -19,19 +19,36 @@
 
   // ---------- which lectures may be recorded (from your synced courses) ----------
   // Until the list arrives, nothing is recorded: the safe default.
-  const tracked = { videos: new Set(), pages: new Set(), ready: false };
+  const tracked = { videos: new Set(), pages: new Set(), courses: new Map(), ready: false };
   async function loadTracked() {
     try {
       const res = await chrome.runtime.sendMessage({ type: "tracked" });
       if (res && Array.isArray(res.videos)) {
         tracked.videos = new Set(res.videos);
         tracked.pages = new Set(res.pages || []);
+        tracked.courses = new Map((res.courses || []).map((c) => [c.key, c]));
         tracked.ready = true;
       }
     } catch {}
   }
   const isTracked = (key) => tracked.ready && !!key &&
     (key.startsWith("yt:") ? tracked.videos.has(key) : tracked.pages.has(key.split("#")[0]));
+  // Same rules as the server's source_key(): which course a URL is, ignoring tracking / UI noise.
+  const NOISE = new Set(["si", "feature", "pp", "index", "t", "start_radio", "ref", "fbclid", "gclid",
+                         "activetab", "tab", "source", "referrer"]);
+  function courseKey(href) {
+    try {
+      const u = new URL(href);
+      const host = u.hostname.toLowerCase().replace(/^www\./, "").replace(/^m\./, "");
+      const list = u.searchParams.get("list");
+      if (["youtube.com", "youtu.be", "music.youtube.com"].includes(host) && list) return "ytlist:" + list;
+      const q = [...u.searchParams].filter(([k]) => !NOISE.has(k.toLowerCase()) && !k.toLowerCase().startsWith("utm_"))
+        .sort((a, b) => (a[0] + "\u0000" + a[1] < b[0] + "\u0000" + b[1] ? -1 : 1));
+      const path = (u.pathname || "/").replace(/\/+$/, "") || "/";
+      return host + path + (q.length ? "?" + new URLSearchParams(q).toString() : "");
+    } catch { return null; }
+  }
+  const courseHere = () => (tracked.ready ? tracked.courses.get(courseKey(location.href)) || null : null);
   loadTracked();
   setInterval(loadTracked, 5 * 60 * 1000);
 
@@ -139,7 +156,7 @@
     }, 5000);
   }
 
-  if (TOP) setTimeout(() => startBar(), 1500);
+  if (TOP) setTimeout(() => startBar(), 800);
   const trackedHere = () => pageKeys().some(isTracked);
 
   // ---------- the Planly bar (top frame only) ----------
@@ -175,6 +192,7 @@
         button.box[aria-checked="true"] span { color: #fff; }
         @media (prefers-color-scheme: dark) { button.box[aria-checked="true"] span { color: #111; } }
         button.box:disabled { cursor: not-allowed; opacity: .45; background-image: repeating-linear-gradient(135deg, rgba(127,127,127,.5) 0 2px, transparent 2px 6px); }
+        [hidden] { display: none !important; }
         button.x { all: unset; cursor: pointer; opacity: .5; padding: 0 2px; }
         .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: currentColor; margin-right: 5px; animation: b 2s infinite; }
         @keyframes b { 50% { opacity: .25; } }
@@ -188,17 +206,31 @@
       </div>`;
     document.documentElement.appendChild(host);
     const $ = (id) => root.getElementById(id);
-    let current = null, dismissed = null, shownFor = null;
+    let current = null, dismissed = null, shownFor = null, mode = null;
     const pageId = () => pageKeys().filter(isTracked).sort().join(",");
     $("x").onclick = () => { dismissed = pageId(); host.style.display = "none"; };
     // The bar shows only while a tracked lecture is on the page (YouTube changes videos without
     // reloading, so this is re-checked every few seconds). Elsewhere: no bar, nothing recorded.
+    // Two modes: a tracked LECTURE (recording + today's progress + tick box), or the COURSE /
+    // playlist page itself (no video yet: says it's in Planly and that lectures opened from it count).
     function place() {
-      const here = trackedHere() ? pageId() : null;
+      const lecture = trackedHere() ? pageId() : null;
+      const course = lecture ? null : courseHere();
+      const here = lecture || (course ? "course:" + course.key : null);
       const show = !!here && here !== dismissed;
       host.style.display = show ? "block" : "none";
-      if (show && here !== shownFor) { shownFor = here; refresh(); }
-      if (!here) shownFor = null;
+      if (show && here !== shownFor) {
+        shownFor = here;
+        mode = lecture ? "lecture" : "course";
+        if (lecture) refresh(); else showCourse(course);
+      }
+      if (!here) { shownFor = null; mode = null; }
+    }
+    function showCourse(c) {
+      current = null;
+      $("line").textContent = c.title;
+      $("sub").textContent = `In Planly · ${c.lectures} lecture${c.lectures === 1 ? "" : "s"} · open one to record it`;
+      $("box").hidden = true; $("meter").hidden = true;
     }
     setInterval(place, 3000);
 
@@ -238,6 +270,6 @@
       refresh();
     };
     place();
-    setInterval(() => { flush(); if (host.style.display !== "none") setTimeout(refresh, 1500); }, 30000);
+    setInterval(() => { flush(); if (host.style.display !== "none" && mode === "lecture") setTimeout(refresh, 1500); }, 30000);
   }
 })();

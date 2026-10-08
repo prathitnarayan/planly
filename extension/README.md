@@ -52,3 +52,7 @@ Only lectures that are in one of your synced courses or playlists. With YouTube 
 music video or anything else outside your courses is ignored: nothing is recorded or sent, and the
 Planly bar doesn't appear. To track a new playlist, sync it first (popup → Sync this page); its
 videos are tracked within a few minutes.
+
+The bar also appears on a synced course or playlist page itself ("In Planly · N lectures"), and comes
+back on every visit or refresh. × hides it for that page only. Syncing a page you already added (even
+from a slightly different URL) updates that course instead of adding a second copy.

@@ -176,7 +176,7 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
       user's own risky time; quote at the top of every morning message, even with no goals
 - [x] "Something came up" (API 0.13.0, no migration: stored in user_settings.integrations.breaks): /me/breaks
       GET/POST/DELETE, panel on the Today card, excused rows, Telegram evening button + /skip
-- [x] API 0.14.0 / extension 0.2.0: record only tracked lectures; expired AI key -> clear 503 (code ai_key_expired);
+- [x] API 0.14.1 / extension 0.2.1: record only tracked lectures; one entry per course (no duplicate syncs); expired AI key -> clear 503 (code ai_key_expired);
       crashes return JSON 500 WITH CORS headers (a header-less 500 made the app say "can't reach the API", 9 Oct)
 - [ ] Learning stage 2 (crowd priors per course item) and 3 (model); long-haul mode (phases, rolling detail,
       revision cycles, books, mock scores, fixed daily blocks)
@@ -247,7 +247,10 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
   Collected only on sites switched On AND only for lectures in the user's synced courses (GET /evidence/tracked:
   "yt:<id>" videos + "page:<origin><path>" lecture pages). Anything else — a music video on YouTube — is never
   recorded, no bar is shown, and /evidence/watch drops it server-side too (real bug 9 Oct: everything was recorded).
-  Until the tracked list loads, nothing is recorded. The bar shows only while a tracked lecture is on the page.
+  Until the tracked list loads, nothing is recorded. The bar shows on a tracked lecture (recording) or on a
+  synced course / playlist page (says it's in Planly); × hides it for that page only. The tracker
+  registration is re-checked every time the service worker wakes (real bug 9 Oct: it was lost, bar never
+  came back on refresh).
 - A disproved session credits nothing (not even its unproven items). Auto-tick needs items to fill >= 80%
   of the session AND every item proven.
 - All thresholds are constants at the top of planners/integrity.py.
@@ -263,6 +266,11 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
   Sections that put state in ?query/#hash are fine.
 - /health returns the API version: check it after a deploy (0.5.0+ has course sync).
 - Items that can't be sized honestly (assignment with no length) go to `unsized`, never a made-up number.
+- A course is identified by `source_key(url)` (schemas/source.py, mirrored in extension watch.js courseKey):
+  YouTube playlists by list id, other pages by host+path+meaningful query (utm_/si/index/tab... ignored).
+  Syncing the same course again REPLACES it and keeps the first URL as its id; GET /sources heals old
+  duplicates (real bug 9 Oct: add-by-link + "Sync this page" stored the playlist twice). A YouTube playlist
+  synced from the tab uses the YouTube API list (exact) when YOUTUBE_API_KEY is set, not the page text.
 
 ## Frontend rules
 - Monochrome only: ink / paper / muted / line / soft tokens (app/globals.css). State via weight, rules and

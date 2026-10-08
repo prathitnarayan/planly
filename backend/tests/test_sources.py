@@ -262,3 +262,43 @@ def test_html_to_text_drops_scripts_and_keeps_lines():
     title, text = html_to_text("<html><head><title>Course</title><script>x=1</script></head>"
                                "<body><li>Intro <b>5:00</b></li><li>Loops 7:00</li></body></html>")
     assert title == "Course" and text.splitlines() == ["Intro 5:00", "Loops 7:00"]
+
+
+def test_same_course_synced_twice_is_one_course(monkeypatch):
+    """Real bug (9 Oct): the playlist added by link, then 'Sync this page' on the same playlist
+    (URL with &si=... or opened from a video) showed up twice."""
+    from app.core import config, web_read
+    from app.schemas.source import source_key
+    assert source_key("https://www.youtube.com/playlist?list=PLx") == "ytlist:PLx"
+    assert source_key("https://youtube.com/playlist?list=PLx&si=abc") == "ytlist:PLx"
+    assert source_key("https://www.youtube.com/watch?v=aaaaaaaaaaa&list=PLx&index=3") == "ytlist:PLx"
+    assert source_key("https://www.udemy.com/course/py/?utm_source=x") == source_key("https://udemy.com/course/py")
+    assert source_key("https://a.com/x?folderId=3") != source_key("https://a.com/x?folderId=4")
+    monkeypatch.setattr(web_read, "youtube_playlist", lambda url: ("Striver Graphs", [
+        {"id": "a" * 11, "title": "G-1 Intro", "duration": "PT12M34S"}]))
+    monkeypatch.setattr(config, "YOUTUBE_API_KEY", "k")
+    client, gid = _client_with_goal()
+    client.post(f"/goals/{gid}/sources/link", json={"url": "https://www.youtube.com/playlist?list=PLx"})
+    r = client.post(f"/goals/{gid}/sources/page", json={
+        "url": "https://www.youtube.com/playlist?list=PLx&si=Zz", "platform": "youtube", "title": "t",
+        "text": "page text the AI would otherwise read", "youtube_ids": []})
+    assert r.status_code == 200 and [i["title"] for i in r.json()["items"]] == ["G-1 Intro"]   # exact list, no AI
+    courses = client.get(f"/goals/{gid}/sources").json()
+    assert len(courses) == 1
+
+
+def test_duplicates_stored_before_the_fix_are_healed():
+    from datetime import datetime, timezone
+    from app.core.auth import DEV_USER_ID
+    from app.main import get_repo
+    client, gid = _client_with_goal()
+    repo = app.dependency_overrides[get_repo]()
+    rec = repo.get(DEV_USER_ID, gid)
+    old = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    rec.sources = [
+        CourseSource(url="https://www.youtube.com/playlist?list=PLx", platform="youtube", title="old", synced_at=old),
+        CourseSource(url="https://www.youtube.com/playlist?list=PLx&si=1", platform="youtube", title="new")]
+    repo.save(DEV_USER_ID, rec)
+    assert len(client.get(f"/goals/{gid}/sources").json()) == 1
+    kept = repo.get(DEV_USER_ID, gid).sources
+    assert len(kept) == 1 and kept[0].title == "new" and kept[0].url == "https://www.youtube.com/playlist?list=PLx"

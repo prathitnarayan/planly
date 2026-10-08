@@ -64,9 +64,9 @@ from app.planners.scheduler import Schedule, build_schedule
 from app.schemas.blueprint import GoalBlueprint
 from app.schemas.interview import GoalCheck, GoalProfile, RealityCheck
 from app.schemas.integrations import GoogleLink, NotifyPrefs, TelegramLink
-from app.schemas.source import CourseSource, SourceItem, parse_duration
+from app.schemas.source import CourseSource, SourceItem, parse_duration, source_key
 
-app = FastAPI(title="Planly API", version="0.14.0")
+app = FastAPI(title="Planly API", version="0.14.1")
 
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
@@ -1607,13 +1607,17 @@ class Tracked(BaseModel):
     playlists. Everything else on YouTube (or any site switched on) is never recorded or stored."""
     videos: list[str]        # "yt:<id>"
     pages: list[str]         # "page:<origin><path>" (any video on that lecture page)
+    courses: list[dict] = [] # the course / playlist pages themselves: {key, title, goal, lectures}
 
 
 def _tracked(user_id: str, repo: GoalRepo) -> Tracked:
-    videos, pages = set(), set()
+    videos, pages, courses = set(), set(), {}
     for g in repo.list(user_id):
         rec = repo.get(user_id, g.id)
         for src in (rec.sources if rec else []):
+            n = sum(1 for it in src.items if video_key(it.url, it.kind))
+            courses.setdefault(source_key(src.url), {"key": source_key(src.url), "title": src.title,
+                                                     "goal": rec.title, "lectures": n})
             for it in src.items:
                 k = video_key(it.url, it.kind)
                 if not k:
@@ -1622,7 +1626,7 @@ def _tracked(user_id: str, repo: GoalRepo) -> Tracked:
                     videos.add(k)
                 else:
                     pages.add(k.split("#", 1)[0])
-    return Tracked(videos=sorted(videos), pages=sorted(pages))
+    return Tracked(videos=sorted(videos), pages=sorted(pages), courses=list(courses.values()))
 
 
 def _is_tracked(key: str, t: Tracked) -> bool:
@@ -1717,9 +1721,27 @@ class SourceView(BaseModel):
     synced_at: datetime
 
 
+def _dedupe_sources(sources: list[CourseSource]) -> list[CourseSource]:
+    """One entry per course (source_key); the most recently synced copy wins, in first-seen order."""
+    latest: dict[str, CourseSource] = {}
+    order: list[str] = []
+    for s in sources:
+        k = source_key(s.url)
+        if k not in latest:
+            order.append(k)
+            latest[k] = s
+        elif s.synced_at >= latest[k].synced_at:
+            latest[k] = s.model_copy(update={"url": latest[k].url})   # keep the first URL: the UI's id
+    return [latest[k] for k in order]
+
+
 def _store_source(ctx: "Ctx", rec: GoalRecord, src: CourseSource) -> SyncResult:
     today = date.today()
-    rec.sources = [s for s in rec.sources if s.url != src.url] + [src]
+    key = source_key(src.url)
+    old = next((s for s in rec.sources if source_key(s.url) == key), None)
+    if old:
+        src = src.model_copy(update={"url": old.url})      # same course synced again: replace, same id
+    rec.sources = [s for s in _dedupe_sources(rec.sources) if source_key(s.url) != key] + [src]
     added, moved = [], []
     kds = {k.key: k for k in rec.interview.profile.key_dates}
     for kd in course_key_dates(src, today):
@@ -1746,6 +1768,12 @@ def sync_source_page(goal_id: str, body: SourcePage, ctx: Ctx = Depends(),
                      llm: LLMClient = Depends(get_llm)) -> SyncResult:
     """Text of a course page (read by the sync tool on the user's laptop) -> items -> measured load."""
     rec = ctx.load(goal_id)
+    # A YouTube playlist tab: read the exact list from YouTube rather than the (lazy, partial) page text.
+    if web_read.playlist_id(body.url) and source_key(body.url).startswith("ytlist:") and config.YOUTUBE_API_KEY:
+        try:
+            return _store_youtube_playlist(ctx, rec, body.url)
+        except web_read.NotAvailable:
+            pass                                            # fall back to reading the page
     text = body.text + _embedded_video_lengths(body.youtube_ids)
     src = llm_call(lambda: extract_source(llm, url=body.url, platform=body.platform,
                                           text=text, title=body.title, today=date.today()))
@@ -1764,6 +1792,14 @@ def _embedded_video_lengths(ids: list[str]) -> str:
     return "\n\n=== Embedded videos (exact lengths) ===\n" + "\n".join(lines) if lines else ""
 
 
+def _store_youtube_playlist(ctx: "Ctx", rec: GoalRecord, url: str) -> SyncResult:
+    title, vids = web_read.youtube_playlist(url)
+    items = [SourceItem(title=v["title"], kind="video", duration_text=v["duration"],
+                        minutes=parse_duration(v["duration"]),
+                        url=f"https://www.youtube.com/watch?v={v['id']}") for v in vids]
+    return _store_source(ctx, rec, CourseSource(url=url, platform="youtube", title=title, items=items))
+
+
 @app.post("/goals/{goal_id}/sources/link", response_model=SyncResult)
 def sync_source_link(goal_id: str, body: SourceLink, ctx: Ctx = Depends(),
                      llm: LLMClient = Depends(get_llm)) -> SyncResult:
@@ -1773,11 +1809,7 @@ def sync_source_link(goal_id: str, body: SourceLink, ctx: Ctx = Depends(),
     url = body.url.strip()
     try:
         if web_read.playlist_id(url) and ("youtube.com" in url or "youtu.be" in url):
-            title, vids = web_read.youtube_playlist(url)
-            items = [SourceItem(title=v["title"], kind="video", duration_text=v["duration"],
-                                minutes=parse_duration(v["duration"]),
-                                url=f"https://www.youtube.com/watch?v={v['id']}") for v in vids]
-            return _store_source(ctx, rec, CourseSource(url=url, platform="youtube", title=title, items=items))
+            return _store_youtube_playlist(ctx, rec, url)
         title, text = web_read.public_page(url)
     except web_read.NotAvailable as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -1797,6 +1829,10 @@ def sync_source_items(goal_id: str, body: SourceItems, ctx: Ctx = Depends()) -> 
 @app.get("/goals/{goal_id}/sources", response_model=list[SourceView])
 def list_sources(goal_id: str, ctx: Ctx = Depends()) -> list[SourceView]:
     rec = ctx.load(goal_id)
+    clean = _dedupe_sources(rec.sources)
+    if len(clean) != len(rec.sources):          # heal duplicates stored before the fix
+        rec.sources = clean
+        ctx.save(rec)
     return [SourceView(load=source_load(s, date.today()), items=s.items, synced_at=s.synced_at)
             for s in rec.sources]
 
@@ -1805,7 +1841,7 @@ def list_sources(goal_id: str, ctx: Ctx = Depends()) -> list[SourceView]:
 def delete_source(goal_id: str, url: str, ctx: Ctx = Depends()) -> dict:
     """Removes the course. Deadlines it added stay (they may be in the plan); edit them if needed."""
     rec = ctx.load(goal_id)
-    kept = [s for s in rec.sources if s.url != url]
+    kept = [s for s in rec.sources if source_key(s.url) != source_key(url)]
     if len(kept) == len(rec.sources):
         raise HTTPException(status_code=404, detail="no course with that url")
     rec.sources = kept

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Planly",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Send the course pages you choose to your Planly plan. Works only on sites you switch on.",
   "action": {
     "default_popup": "popup.html",

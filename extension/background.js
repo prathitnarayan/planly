@@ -71,6 +71,11 @@ async function syncContentScripts() {
     })));
   }
 }
+// Every time the service worker wakes, make sure the tracker is registered for the sites you
+// switched on, so it starts by itself on every visit and refresh (real bug 9 Oct: after the bar was
+// closed it never came back, because the registration had been lost and only the one-off
+// injection from the popup had been running).
+syncContentScripts().catch(() => {});
 chrome.runtime.onInstalled.addListener(() => syncContentScripts().catch(() => {}));
 chrome.runtime.onStartup.addListener(() => syncContentScripts().catch(() => {}));
 chrome.permissions.onAdded.addListener(() => syncContentScripts().catch(() => {}));
@@ -85,7 +90,7 @@ async function getTracked() {
   if (trackedCache && Date.now() - trackedCache.at < TRACKED_MINUTES * 60_000) return trackedCache;
   try {
     const t = await api("GET", "/evidence/tracked");
-    trackedCache = { at: Date.now(), videos: t.videos || [], pages: t.pages || [] };
+    trackedCache = { at: Date.now(), videos: t.videos || [], pages: t.pages || [], courses: t.courses || [] };
     await chrome.storage.local.set({ tracked: trackedCache });
   } catch {
     const { tracked } = await chrome.storage.local.get("tracked");
@@ -140,7 +145,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     return true;
   }
   if (msg.type === "tracked") {
-    getTracked().then((t) => reply({ videos: t.videos, pages: t.pages }))
+    getTracked().then((t) => reply({ videos: t.videos, pages: t.pages, courses: t.courses || [] }))
       .catch(() => reply({ videos: [], pages: [] }));
     return true;
   }

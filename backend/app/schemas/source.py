@@ -167,3 +167,27 @@ class CourseSource(BaseModel):
     title: str
     items: list[SourceItem] = Field(default_factory=list)
     synced_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# UI state and tracking bits in a URL that don't change WHICH course it is.
+_NOISE_PARAMS = {"si", "feature", "pp", "index", "t", "start_radio", "ref", "fbclid", "gclid",
+                 "activetab", "tab", "source", "referrer"}
+
+
+def source_key(url: str) -> str:
+    """Which course a URL is, ignoring the noise, so syncing the same course again replaces it.
+    Real bug (9 Oct): the playlist added by link and the same playlist synced from the tab
+    (with &si=..., or opened from a video with &index=3) were stored twice.
+      YouTube playlist (playlist page, or any video opened inside it) -> "ytlist:<id>"
+      everything else -> host without www + path without trailing slash + meaningful query"""
+    from urllib.parse import parse_qsl, urlencode, urlsplit
+    u = urlsplit(url.strip())
+    host = (u.hostname or "").lower().removeprefix("www.").removeprefix("m.")
+    q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=False)]
+    if host in ("youtube.com", "youtu.be", "music.youtube.com"):
+        lst = next((v for k, v in q if k == "list"), None)
+        if lst:
+            return f"ytlist:{lst}"
+    q = sorted((k, v) for k, v in q if k.lower() not in _NOISE_PARAMS and not k.lower().startswith("utm_"))
+    path = (u.path or "/").rstrip("/") or "/"
+    return f"{host}{path}" + (f"?{urlencode(q)}" if q else "")
