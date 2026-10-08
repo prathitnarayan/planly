@@ -43,6 +43,7 @@ async function syncTab(tabId, url, goalId, goalTitle, auto) {
       ...result.key_dates_moved.map((k) => `~ deadline moved: ${k}`),
     ];
     badge(tabId, "✓");
+    trackedCache = null;                      // new lectures may now be tracked
     return await setWatched(url, { status: "done", lastSync: Date.now(), lines });
   } catch (e) {
     badge(tabId, "!");
@@ -75,10 +76,33 @@ chrome.runtime.onStartup.addListener(() => syncContentScripts().catch(() => {}))
 chrome.permissions.onAdded.addListener(() => syncContentScripts().catch(() => {}));
 chrome.permissions.onRemoved.addListener(() => syncContentScripts().catch(() => {}));
 
+// Which lectures may be recorded: only those in your synced courses (GET /evidence/tracked).
+// Kept in storage too, so it still works while Planly is asleep (free Render plan).
+const TRACKED_MINUTES = 10;
+let trackedCache = null;   // { at, videos: [], pages: [] }
+
+async function getTracked() {
+  if (trackedCache && Date.now() - trackedCache.at < TRACKED_MINUTES * 60_000) return trackedCache;
+  try {
+    const t = await api("GET", "/evidence/tracked");
+    trackedCache = { at: Date.now(), videos: t.videos || [], pages: t.pages || [] };
+    await chrome.storage.local.set({ tracked: trackedCache });
+  } catch {
+    const { tracked } = await chrome.storage.local.get("tracked");
+    trackedCache = tracked || { at: Date.now(), videos: [], pages: [] };   // offline: last known list
+  }
+  return trackedCache;
+}
+
+const isTracked = (t, key) => !!key && (key.startsWith("yt:") ? t.videos.includes(key)
+  : t.pages.includes(key.split("#")[0]));
+
 // Evidence is queued in storage so nothing is lost if Planly is asleep (free Render plan).
 async function sendWatch(events) {
   const { watchQueue = [] } = await chrome.storage.local.get("watchQueue");
-  const queue = [...watchQueue, ...events].slice(-500);
+  const t = await getTracked();
+  // also drops anything an older version queued from outside your courses
+  const queue = [...watchQueue, ...events].filter((e) => isTracked(t, e.key)).slice(-500);
   try {
     for (let i = 0; i < queue.length; i += 50) await api("POST", "/evidence/watch", { events: queue.slice(i, i + 50) });
     await chrome.storage.local.set({ watchQueue: [] });
@@ -113,6 +137,11 @@ async function lookup(keys) {
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   if (msg.type === "watch") {
     sendWatch(msg.events).finally(() => reply({ ok: true }));
+    return true;
+  }
+  if (msg.type === "tracked") {
+    getTracked().then((t) => reply({ videos: t.videos, pages: t.pages }))
+      .catch(() => reply({ videos: [], pages: [] }));
     return true;
   }
   if (msg.type === "lookup") {

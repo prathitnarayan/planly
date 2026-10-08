@@ -176,6 +176,8 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
       user's own risky time; quote at the top of every morning message, even with no goals
 - [x] "Something came up" (API 0.13.0, no migration: stored in user_settings.integrations.breaks): /me/breaks
       GET/POST/DELETE, panel on the Today card, excused rows, Telegram evening button + /skip
+- [x] API 0.14.0 / extension 0.2.0: record only tracked lectures; expired AI key -> clear 503 (code ai_key_expired);
+      crashes return JSON 500 WITH CORS headers (a header-less 500 made the app say "can't reach the API", 9 Oct)
 - [ ] Learning stage 2 (crowd priors per course item) and 3 (model); long-haul mode (phases, rolling detail,
       revision cycles, books, mock scores, fixed daily blocks)
 - [ ] Codeforces/LeetCode solved via their APIs (stronger practice evidence); trust per user instead of per goal
@@ -242,7 +244,10 @@ python -m uvicorn app.main:app --reload --reload-dir app  # API at http://localh
 - A penalty needs PROOF: video opened in tracked Chrome but < 50% of the planned part played, or the site
   re-read AFTER the tick still shows it not done. No evidence = self-reported, never punished.
 - Watch evidence only grows (union of played ranges), only while the tab is visible, ads and > 2x skipped.
-  Collected only on sites switched On; the on-page bar always shows it's recording.
+  Collected only on sites switched On AND only for lectures in the user's synced courses (GET /evidence/tracked:
+  "yt:<id>" videos + "page:<origin><path>" lecture pages). Anything else — a music video on YouTube — is never
+  recorded, no bar is shown, and /evidence/watch drops it server-side too (real bug 9 Oct: everything was recorded).
+  Until the tracked list loads, nothing is recorded. The bar shows only while a tracked lecture is on the page.
 - A disproved session credits nothing (not even its unproven items). Auto-tick needs items to fill >= 80%
   of the session AND every item proven.
 - All thresholds are constants at the top of planners/integrity.py.

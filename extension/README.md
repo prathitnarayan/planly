@@ -44,3 +44,11 @@ Switch a site **Off** any time: Chrome removes the access and Planly forgets its
 
 ## Updating the extension
 After replacing this folder with a newer version: `chrome://extensions` → Planly → ↻ reload.
+
+
+## What gets recorded (since 0.2.0)
+
+Only lectures that are in one of your synced courses or playlists. With YouTube switched on, a
+music video or anything else outside your courses is ignored: nothing is recorded or sent, and the
+Planly bar doesn't appear. To track a new playlist, sync it first (popup → Sync this page); its
+videos are tracked within a few minutes.

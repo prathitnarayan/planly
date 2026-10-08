@@ -66,9 +66,25 @@ from app.schemas.interview import GoalCheck, GoalProfile, RealityCheck
 from app.schemas.integrations import GoogleLink, NotifyPrefs, TelegramLink
 from app.schemas.source import CourseSource, SourceItem, parse_duration
 
-app = FastAPI(title="Planly API", version="0.13.0")
+app = FastAPI(title="Planly API", version="0.14.0")
 
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+
+
+@app.middleware("http")
+async def crash_as_json(request: Request, call_next):
+    """Registered BEFORE CORS so it sits inside it. A crash (500) used to leave without CORS headers,
+    so the browser hid it and the app said "can't reach the API" (real incident, 9 Oct). Now the
+    browser gets a readable 500 and the traceback still goes to the log."""
+    import logging
+    try:
+        return await call_next(request)
+    except Exception:
+        logging.getLogger("planly").exception("unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=500, content={
+            "detail": "Something broke on Planly's side. It has been logged; try again, and if it keeps "
+                      "happening, check the Render logs.", "code": "server_error"})
+
 
 # The browser frontend runs on another port; allow it (and only it) to call the API.
 app.add_middleware(
@@ -77,6 +93,31 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+
+import openai as _openai  # noqa: E402
+
+
+@app.exception_handler(_openai.AuthenticationError)
+async def ai_key_rejected(_: Request, exc: Exception) -> JSONResponse:
+    """Real incident (9 Oct): the aipipe token (a JWT with an expiry) ran out, and every AI step
+    crashed with a bare 500. Say what happened and where to fix it."""
+    expired = "expired" in str(exc).lower()
+    return JSONResponse(status_code=503, content={
+        "detail": ("Planly's AI key has expired. " if expired else "Planly's AI key was rejected. ")
+                  + "Put a fresh key in OPENAI_API_KEY on Render (Environment), then redeploy.",
+        "code": "ai_key_expired" if expired else "ai_key_invalid",
+    })
+
+
+@app.exception_handler(_openai.APIConnectionError)
+@app.exception_handler(_openai.RateLimitError)
+@app.exception_handler(_openai.InternalServerError)
+async def ai_unavailable(_: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(status_code=503, content={
+        "detail": "The AI service is busy or unreachable right now. Try again in a minute.",
+        "code": "ai_unavailable",
+    })
 
 
 try:  # only when Postgres support is installed
@@ -1561,11 +1602,48 @@ class WatchBatch(BaseModel):
     events: list[WatchEvent] = Field(max_length=50)
 
 
+class Tracked(BaseModel):
+    """What the extension may record: ONLY lectures that are in one of the user's synced courses /
+    playlists. Everything else on YouTube (or any site switched on) is never recorded or stored."""
+    videos: list[str]        # "yt:<id>"
+    pages: list[str]         # "page:<origin><path>" (any video on that lecture page)
+
+
+def _tracked(user_id: str, repo: GoalRepo) -> Tracked:
+    videos, pages = set(), set()
+    for g in repo.list(user_id):
+        rec = repo.get(user_id, g.id)
+        for src in (rec.sources if rec else []):
+            for it in src.items:
+                k = video_key(it.url, it.kind)
+                if not k:
+                    continue
+                if k.startswith("yt:"):
+                    videos.add(k)
+                else:
+                    pages.add(k.split("#", 1)[0])
+    return Tracked(videos=sorted(videos), pages=sorted(pages))
+
+
+def _is_tracked(key: str, t: Tracked) -> bool:
+    return key in t.videos if key.startswith("yt:") else key.split("#", 1)[0] in t.pages
+
+
+@app.get("/evidence/tracked", response_model=Tracked)
+def get_tracked(user_id: str = Depends(current_user), repo: GoalRepo = Depends(get_repo)) -> Tracked:
+    return _tracked(user_id, repo)
+
+
 @app.post("/evidence/watch")
 def post_watch(body: WatchBatch, user_id: str = Depends(current_user), repo: GoalRepo = Depends(get_repo)) -> dict:
-    """Played ranges of videos on sites the user switched on. Only ever adds (union)."""
-    merged = repo.merge_watch(user_id, [WatchEvidence(**e.model_dump()) for e in body.events])
-    return {"coverage": {k: round(coverage(v), 3) for k, v in merged.items()}}
+    """Played ranges of lectures from the user's own synced courses. Only ever adds (union).
+    Anything else (a random YouTube video, an older extension that recorded everything) is dropped
+    here too, so it is never stored."""
+    t = _tracked(user_id, repo)
+    keep = [e for e in body.events if _is_tracked(e.key, t)]
+    merged = repo.merge_watch(user_id, [WatchEvidence(**e.model_dump()) for e in keep]) if keep else {}
+    return {"coverage": {k: round(coverage(v), 3) for k, v in merged.items()},
+            "ignored": len(body.events) - len(keep)}
 
 
 class GoalToday(BaseModel):

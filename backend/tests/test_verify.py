@@ -225,3 +225,26 @@ def test_video_keys_for_youtube_and_lecture_pages():
     assert video_key("https://youtu.be/abcdefghijk") == "yt:abcdefghijk"
     assert video_key("https://www.udemy.com/course/x/learn/lecture/42?start=0") == "page:https://www.udemy.com/course/x/learn/lecture/42#1"
     assert video_key("https://leetcode.com/problems/two-sum/", "practice") is None
+
+
+def test_api_only_lectures_from_synced_courses_are_recorded(goal):
+    """Real bug (9 Oct): with YouTube switched on, every video was recorded, not just the playlist."""
+    c, gid, clock, repo = goal
+    tracked = c.get("/evidence/tracked").json()
+    assert "yt:" + "a" * 11 in tracked["videos"] and "yt:" + "b" * 11 in tracked["videos"]
+    r = c.post("/evidence/watch", json={"events": [
+        {"key": "yt:" + "z" * 11, "duration_s": 600, "intervals": [[0, 300]]},          # a music video
+        {"key": "yt:" + "a" * 11, "duration_s": 1200, "intervals": [[0, 60]]}]}).json()
+    assert r["ignored"] == 1 and list(r["coverage"]) == ["yt:" + "a" * 11]
+    assert repo.get_watch(DEV_USER_ID, ["yt:" + "z" * 11]) == {}                         # never stored
+    # lecture pages (Udemy / IITM): any video on that page counts, other pages don't
+    rec = repo.get(DEV_USER_ID, gid)
+    from app.schemas.source import CourseSource, SourceItem
+    rec.sources.append(CourseSource(url="https://www.udemy.com/course/x/", platform="udemy", title="X", items=[
+        SourceItem(title="L1", kind="video", minutes=10, url="https://www.udemy.com/course/x/learn/lecture/1")]))
+    repo.save(DEV_USER_ID, rec)
+    assert c.get("/evidence/tracked").json()["pages"] == ["page:https://www.udemy.com/course/x/learn/lecture/1"]
+    r = c.post("/evidence/watch", json={"events": [
+        {"key": "page:https://www.udemy.com/course/x/learn/lecture/1#2", "duration_s": 600, "intervals": [[0, 30]]},
+        {"key": "page:https://www.udemy.com/course/y/learn/lecture/9#1", "duration_s": 600, "intervals": [[0, 30]]}]}).json()
+    assert r["ignored"] == 1

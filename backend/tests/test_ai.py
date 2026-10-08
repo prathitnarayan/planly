@@ -500,3 +500,44 @@ def test_api_bad_ai_output_is_502(client_with):
     c = client_with(["garbage", "still garbage"])
     res = c.post("/goals", json={"goal": "x"})
     assert res.status_code == 502
+
+
+def test_expired_ai_key_is_a_clear_503_not_a_500():
+    """Real incident (9 Oct): the aipipe JWT expired and /goals/check returned a bare 500."""
+    import httpx
+    import openai
+    from fastapi.testclient import TestClient
+    from app.main import app, get_llm
+
+    class Expired:
+        def complete_json(self, system, messages):
+            req = httpx.Request("POST", "https://aipipe.org/openai/v1/chat/completions")
+            raise openai.AuthenticationError(
+                "Bearer token is invalid: JWTExpired", body=None,
+                response=httpx.Response(401, request=req))
+
+    app.dependency_overrides[get_llm] = lambda: Expired()
+    try:
+        r = TestClient(app, raise_server_exceptions=False).post("/goals/check", json={"text": "Learn DSA"})
+    finally:
+        app.dependency_overrides.pop(get_llm, None)
+    assert r.status_code == 503 and r.json()["code"] == "ai_key_expired"
+    assert "OPENAI_API_KEY" in r.json()["detail"]
+
+
+def test_a_crash_still_carries_cors_headers():
+    """Real incident (9 Oct): a 500 had no CORS headers, so the browser showed "can't reach the API"."""
+    from fastapi.testclient import TestClient
+    from app.core import config
+    from app.main import app, get_llm
+
+    class Boom:
+        def complete_json(self, system, messages):
+            raise RuntimeError("boom")
+
+    app.dependency_overrides[get_llm] = lambda: Boom()
+    origin = config.FRONTEND_ORIGINS[0]
+    r = TestClient(app, raise_server_exceptions=False).post("/goals/check", json={"text": "x"},
+                                                            headers={"Origin": origin})
+    assert r.status_code == 500 and r.json()["code"] == "server_error"
+    assert r.headers.get("access-control-allow-origin") == origin

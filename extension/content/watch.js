@@ -1,5 +1,7 @@
-// Planly watch tracker. Runs ONLY on sites you switched on in the Planly popup.
-// Records which parts of each video actually played:
+// Planly watch tracker. Runs ONLY on sites you switched on in the Planly popup, and records ONLY
+// lectures that are in one of your synced courses / playlists (the "tracked" list from Planly).
+// Any other video on the site (your music, a random YouTube video) is never recorded or sent.
+// Records which parts of each tracked lecture actually played:
 //   - only while the tab is visible (a background tab playing audio doesn't count)
 //   - skipping ahead starts a new range; the skipped part isn't counted
 //   - ads (YouTube) and speeds above 2x aren't counted
@@ -14,6 +16,24 @@
   let lastPlayed = null;             // the video most recently playing (for page time)
   let pending = {};                  // key -> { key, url, title, duration_s, intervals: [] }
   let index = 0;
+
+  // ---------- which lectures may be recorded (from your synced courses) ----------
+  // Until the list arrives, nothing is recorded: the safe default.
+  const tracked = { videos: new Set(), pages: new Set(), ready: false };
+  async function loadTracked() {
+    try {
+      const res = await chrome.runtime.sendMessage({ type: "tracked" });
+      if (res && Array.isArray(res.videos)) {
+        tracked.videos = new Set(res.videos);
+        tracked.pages = new Set(res.pages || []);
+        tracked.ready = true;
+      }
+    } catch {}
+  }
+  const isTracked = (key) => tracked.ready && !!key &&
+    (key.startsWith("yt:") ? tracked.videos.has(key) : tracked.pages.has(key.split("#")[0]));
+  loadTracked();
+  setInterval(loadTracked, 5 * 60 * 1000);
 
   const ytId = (href) => {
     const m = (href || "").match(/(?:youtube(?:-nocookie)?\.com\/(?:embed\/|shorts\/|watch\?(?:.*&)?v=)|youtu\.be\/)([A-Za-z0-9_-]{11})/);
@@ -37,7 +57,7 @@
   }
 
   function close(video, st) {
-    if (st.segStart != null && st.lastT != null && st.lastT - st.segStart >= 1) {
+    if (st.segStart != null && st.lastT != null && st.lastT - st.segStart >= 1 && isTracked(st.key)) {
       const dur = Number.isFinite(video.duration) ? video.duration : 0;
       if (dur > 0) {
         const p = (pending[st.key] ||= { key: st.key, url: location.href.slice(0, 2000), title: title(),
@@ -52,7 +72,7 @@
     let st = states.get(video);
     if (!st) states.set(video, (st = { key: keyFor(video), segStart: null, lastT: null }));
     const key = keyFor(video);
-    const counting = !video.paused && !video.ended && document.visibilityState === "visible"
+    const counting = isTracked(key) && !video.paused && !video.ended && document.visibilityState === "visible"
       && video.playbackRate <= MAX_RATE && !adPlaying() && Number.isFinite(video.duration);
     const t = video.currentTime;
     if (key !== st.key) { close(video, st); st.key = key; }            // YouTube moved to the next video
@@ -82,7 +102,7 @@
     for (const [video, st] of states) {                               // include the running segment
       if (st.segStart != null) { close(video, st); if (!video.paused) st.segStart = video.currentTime; }
     }
-    const events = Object.values(pending).filter((e) => e.intervals.length || e.active_s > 0);
+    const events = Object.values(pending).filter((e) => isTracked(e.key) && (e.intervals.length || e.active_s > 0));
     pending = {};
     if (events.length) {
       try { chrome.runtime.sendMessage({ type: "watch", events }); } catch {}
@@ -112,7 +132,7 @@
       const playing = [...document.querySelectorAll("video")].some((v) => !v.paused && !v.ended);
       if (!playing && Date.now() - lastInput > 5 * 60 * 1000) return;
       const v = pageVideo();
-      if (!v) return;
+      if (!v || !isTracked(v.key)) return;
       const p = (pending[v.key] ||= { key: v.key, url: location.href.slice(0, 2000), title: title(),
                                       duration_s: Math.min(v.duration || 0, 86400), intervals: [] });
       p.active_s = (p.active_s || 0) + 5;
@@ -120,6 +140,7 @@
   }
 
   if (TOP) setTimeout(() => startBar(), 1500);
+  const trackedHere = () => pageKeys().some(isTracked);
 
   // ---------- the Planly bar (top frame only) ----------
   function pageKeys() {
@@ -131,7 +152,7 @@
 
   function startBar() {
     const host = document.createElement("div");
-    host.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:2147483647;";
+    host.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:2147483647;display:none;";
     const root = host.attachShadow({ mode: "closed" });
     root.innerHTML = `
       <style>
@@ -160,15 +181,26 @@
       </style>
       <div class="bar" role="status">
         <span class="logo">p.</span>
-        <div class="grow"><div class="t" id="line"><span class="dot"></span>Planly is recording what you watch here</div>
+        <div class="grow"><div class="t" id="line"><span class="dot"></span>Planly is recording this lecture</div>
           <div class="muted t" id="sub"></div><div class="meter" id="meter" hidden><div class="fill" id="fill"></div></div></div>
         <button class="box" id="box" role="checkbox" aria-checked="false" hidden title="Done in Planly"><span>✓</span></button>
         <button class="x" id="x" title="Hide">×</button>
       </div>`;
     document.documentElement.appendChild(host);
     const $ = (id) => root.getElementById(id);
-    $("x").onclick = () => host.remove();
-    let current = null;
+    let current = null, dismissed = null, shownFor = null;
+    const pageId = () => pageKeys().filter(isTracked).sort().join(",");
+    $("x").onclick = () => { dismissed = pageId(); host.style.display = "none"; };
+    // The bar shows only while a tracked lecture is on the page (YouTube changes videos without
+    // reloading, so this is re-checked every few seconds). Elsewhere: no bar, nothing recorded.
+    function place() {
+      const here = trackedHere() ? pageId() : null;
+      const show = !!here && here !== dismissed;
+      host.style.display = show ? "block" : "none";
+      if (show && here !== shownFor) { shownFor = here; refresh(); }
+      if (!here) shownFor = null;
+    }
+    setInterval(place, 3000);
 
     async function refresh() {
       if (!host.isConnected) return;
@@ -176,8 +208,8 @@
       try { res = await chrome.runtime.sendMessage({ type: "lookup", keys: pageKeys() }); } catch { return; }
       current = res && res.match;
       if (!current) {
-        $("line").innerHTML = '<span class="dot"></span>Planly is recording what you watch here';
-        $("sub").textContent = res && res.error ? res.error : "Not in today's plan.";
+        $("line").innerHTML = '<span class="dot"></span>Planly is recording this lecture';
+        $("sub").textContent = res && res.error ? res.error : "From your course · not in today's plan.";
         $("box").hidden = true; $("meter").hidden = true;
         return;
       }
@@ -205,7 +237,7 @@
       if (res && res.error) $("sub").textContent = res.error;
       refresh();
     };
-    refresh();
-    setInterval(() => { flush(); setTimeout(refresh, 1500); }, 30000);
+    place();
+    setInterval(() => { flush(); if (host.style.display !== "none") setTimeout(refresh, 1500); }, 30000);
   }
 })();
